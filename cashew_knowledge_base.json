@@ -1,0 +1,132 @@
+{
+  "Anthracnose": {
+    "scientific_name": "Colletotrichum gloeosporioides",
+    "category": "Fungal Disease",
+    "symptoms": [
+      "Water-soaked reddish-brown lesions on leaves, young shoots, and inflorescences.",
+      "Browning and drying of young leaves and flower panicles.",
+      "Resin exudation and dieback of affected branches."
+    ],
+    "favorable_conditions": "High humidity (>85%), warm temperatures (25-30°C), and frequent rain showers during flowering.",
+    "organic_treatment": [
+      "Prune and burn infected shoots and panicles before flowering season.",
+      "Apply Neem seed kernel extract (NSKE 5%) or Copper Hydroxide spray."
+    ],
+    "chemical_treatment": [
+      "Foliar spray of Carbendazim (0.1%) or Mancozeb (0.2%) at flush stage.",
+      "Copper Oxychloride (0.3%) spray at emergence of flower panicles."
+    ],
+    "prevention": "Maintain adequate tree spacing for sunlight penetration and air circulation."
+  },
+  "Gummosis": {
+    "scientific_name": "Lasiodiplodia theobromae",
+    "category": "Fungal Disease",
+    "symptoms": [
+      "Exudation of brownish gum resin from bark crevices on trunk and major branches.",
+      "Bark cracking, longitudinal wood splitting, and yellowing of foliage.",
+      "Gradual canopy dieback and tree decline."
+    ],
+    "favorable_conditions": "Bark injury from borers or pruning tools, high temperature, and drought stress followed by rains.",
+    "organic_treatment": [
+      "Scrape off infected bark tissue cleanly with a sharp knife.",
+      "Apply Trichoderma viride bio-paste mixed with cow dung and neem oil on scraped lesions."
+    ],
+    "chemical_treatment": [
+      "Apply Bordeaux paste (10%) on the trunk up to 1 meter height.",
+      "Drench root zone with Metalaxyl + Mancozeb (0.2%)."
+    ],
+    "prevention": "Avoid physical damage during weeding and control stem borer attacks promptly."
+  },
+  "Leaf_Miner": {
+    "scientific_name": "Liriomyza spp. / Acrocercops syngramma",
+    "category": "Insect Pest",
+    "symptoms": [
+      "Transparent silvery serpentine mines or blotches on tender young leaves.",
+      "Blistering and curling of affected leaf margins.",
+      "Drying and premature shedding of infested foliage."
+    ],
+    "favorable_conditions": "Emergence of new vegetative leaf flushes after monsoon rains.",
+    "organic_treatment": [
+      "Spray Neem oil (3% or 10,000 ppm) at early flush initiation.",
+      "Release natural parasitoids like Chrysocharis spp."
+    ],
+    "chemical_treatment": [
+      "Foliar spray of Quinalphos (0.05%) or Dimethoate (0.05%) during new shoot emergence."
+    ],
+    "prevention": "Monitor light traps and remove heavily infested lower leaves."
+  },
+  "Tea_Mosquito_Bug": {
+    "scientific_name": "Helopeltis antonii",
+    "category": "Insect Pest",
+    "symptoms": [
+      "Necrotic brown spots surrounded by water-soaked halos on tender shoots and inflorescences.",
+      "Exudation of resinous droplets from feeding punctures.",
+      "Scorched appearance of panicles ('Blossom Blight') leading to total nut yield loss."
+    ],
+    "favorable_conditions": "Cloudy weather and high humidity during new flush and flowering periods.",
+    "organic_treatment": [
+      "Spray Beauveria bassiana entomopathogenic fungal suspension (1x10^8 spores/ml).",
+      "Apply Fish oil rosin soap (25 g/L)."
+    ],
+    "chemical_treatment": [
+      "First spray: Lambda-cyhalothrin 5 EC (0.006%) at flush stage.",
+      "Second spray: Carbaryl 50 WP (0.1%) at panicle emergence.",
+      "Third spray: Imidacloprid 17.8 SL (0.006%) at fruit set."
+    ],
+    "prevention": "Synchronize spray schedules across neighboring cashew plantations during flush stage."
+  },
+  "Stem_Borer": {
+    "scientific_name": "Plocaederus ferrugineus",
+    "category": "Insect Pest",
+    "symptoms": [
+      "Extrusions of frass (wood dust mixed with gum) at trunk base.",
+      "Bark swelling and yellowing/browning of main branch leaves.",
+      "Bark loosening and tunnel formation under inner bark."
+    ],
+    "favorable_conditions": "Neglected orchards with old, unpruned, or stressed trees.",
+    "organic_treatment": [
+      "Mechanically extract grubs using chisel and wire hooks without ringing trunk.",
+      "Apply Metarhizium anisopliae spore suspension in trunk crevices."
+    ],
+    "chemical_treatment": [
+      "Swab collar region with Chlorpyrifos 20 EC (0.2%) or Carbaryl (1%).",
+      "Insert Phostoxin / Aluminum Phosphide tablets into active tunnels and seal with clay."
+    ],
+    "prevention": "Remove dead cashew trees and keep trunk base clear of weeds and organic debris."
+  },
+  "Powdery_Mildew": {
+    "scientific_name": "Oidium anacardii",
+    "category": "Fungal Disease",
+    "symptoms": [
+      "White powdery growth covering young leaves, panicles, and tender nuts.",
+      "Stunting and malformation of inflorescences.",
+      "Shedding of flowers and young cashew apples."
+    ],
+    "favorable_conditions": "Dry days with cool nights and morning dew during flowering.",
+    "organic_treatment": [
+      "Spray Wettable Sulfur (0.2%) at bi-weekly intervals.",
+      "Apply baking soda solution (0.5%) mixed with liquid horticultural soap."
+    ],
+    "chemical_treatment": [
+      "Foliar spray of Hexaconazole (0.1%) or Triadimefon (0.1%) upon first sign of infection."
+    ],
+    "prevention": "Prune dense tree canopies to permit maximum sunlight exposure."
+  },
+  "Healthy": {
+    "scientific_name": "Anacardium occidentale (Healthy)",
+    "category": "Healthy Crop",
+    "symptoms": [
+      "Vibrant green leaves free from chlorosis, lesions, or insect mines.",
+      "Normal leaf structure with smooth cuticles and unblemished panicles.",
+      "Vigorous shoot growth and normal cashew apple development."
+    ],
+    "favorable_conditions": "Balanced soil nutrients, optimal irrigation, and periodic pruning.",
+    "organic_treatment": [
+      "Continue standard organic mulching and vermicompost application."
+    ],
+    "chemical_treatment": [
+      "No chemical intervention needed."
+    ],
+    "prevention": "Maintain regular farm monitoring and integrated pest management (IPM)."
+  }
+}
