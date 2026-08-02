@@ -1,21 +1,28 @@
 """
 Cashew Pest and Disease Diagnosis System
-Global Configuration & Experiment Parameters
+Phase 4: Global Configuration Parameters
+Framework: TensorFlow / Keras
 """
 
 import os
-import torch
-from pathlib import Path
 
 class Config:
     # ---------------------------------------------------------
-    # System & Seed Settings
+    # System & Reproducibility Settings
     # ---------------------------------------------------------
     SEED = 42
     PROJECT_NAME = "Cashew_Pest_Disease_Project"
     
     # ---------------------------------------------------------
-    # Supported Vision Models (1-10)
+    # Dataset & Preprocessing Specifications
+    # ---------------------------------------------------------
+    IMG_HEIGHT = 224
+    IMG_WIDTH = 224
+    IMG_SIZE = (IMG_HEIGHT, IMG_WIDTH)
+    CHANNELS = 3  # RGB preservation
+    
+    # ---------------------------------------------------------
+    # Supported TensorFlow / Keras Vision Architectures (1-8)
     # ---------------------------------------------------------
     MODEL_MAP = {
         1: ("01_MobileNetV2", "mobilenet_v2"),
@@ -23,28 +30,23 @@ class Config:
         3: ("03_VGG16", "vgg16"),
         4: ("04_InceptionV3", "inception_v3"),
         5: ("05_DenseNet121", "densenet121"),
-        6: ("06_EfficientNetV2", "efficientnet_v2_s"),
-        7: ("07_MobileNetV3", "mobilenet_v3_large"),
-        8: ("08_ConvNeXt", "convnext_tiny"),
-        9: ("09_SwinTransformer", "swin_t"),
-        10: ("10_DINOv2", "dinov2_vits14")
+        6: ("06_EfficientNetV2B0", "efficientnet_v2_b0"),
+        7: ("07_MobileNetV3Large", "mobilenet_v3_large"),
+        8: ("08_ConvNeXtTiny", "convnext_tiny")
     }
 
     # ---------------------------------------------------------
-    # Target Classes (Inferred dynamically from raw folder if present)
+    # Target Classes (Dynamic folder auto-detection fallback)
     # ---------------------------------------------------------
     DEFAULT_CLASSES = [
-        "Anthracnose",
-        "Gummosis",
-        "Healthy",
+        "Aphids",
+        "Leaf_Blight",
         "Leaf_Miner",
-        "Powdery_Mildew",
-        "Stem_Borer",
-        "Tea_Mosquito_Bug"
+        "TMB"
     ]
     
     # ---------------------------------------------------------
-    # Dataset Split Ratios
+    # Reproducible Split Ratios (70% Train / 15% Val / 15% Test)
     # ---------------------------------------------------------
     TRAIN_RATIO = 0.70
     VAL_RATIO = 0.15
@@ -53,45 +55,76 @@ class Config:
     # ---------------------------------------------------------
     # Training Hyperparameters
     # ---------------------------------------------------------
+    BATCH_SIZE = 32
     EPOCHS = 50
-    LEARNING_RATE = 0.0001
-    WEIGHT_DECAY = 1e-4
-    PATIENCE = 10  # Early stopping patience
-    UNFREEZE_EPOCH = 5  # Unfreeze backbone after 5 epochs
-    CONFIDENCE_THRESHOLD = 0.80  # 80% confidence requirement
+    WARMUP_EPOCHS = 5  # Initial epochs with frozen backbone
+    LEARNING_RATE = 1e-4
+    FINE_TUNE_LEARNING_RATE = 1e-5
+    OPTIMIZER = "adam"  # Options: adam, adamw, sgd
+    PATIENCE = 10
+    REDUCE_LR_PATIENCE = 3
 
     # ---------------------------------------------------------
-    # Device Resolution
+    # Inference Confidence Threshold & Uncertainty Policy
     # ---------------------------------------------------------
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    CONFIDENCE_THRESHOLD = 0.80  # 80% confidence requirement to avoid random guessing
+    UNCERTAIN_PREDICTION_MESSAGE = "Prediction Uncertain. Please upload a clearer image"
 
+    # ---------------------------------------------------------
+    # Dynamic Google Drive Path Resolvers
+    # ---------------------------------------------------------
     @classmethod
     def get_base_dir(cls) -> str:
-        """Dynamically resolves root path (Google Drive vs Local workspace)."""
+        """Resolves root path dynamically (Google Drive vs Local workspace)."""
         drive_path = "/content/drive/MyDrive"
         if os.path.exists(drive_path):
             return os.path.join(drive_path, cls.PROJECT_NAME)
         return os.path.join(os.getcwd(), cls.PROJECT_NAME)
 
     @classmethod
+    def get_raw_dir(cls) -> str:
+        """Returns path to raw dataset: /content/drive/MyDrive/Cashew_Pest_Disease_Project/Dataset/Raw/"""
+        return os.path.join(cls.get_base_dir(), "Dataset", "Raw")
+
+    @classmethod
+    def get_cleaned_dir(cls) -> str:
+        """Returns path to cleaned dataset."""
+        return os.path.join(cls.get_base_dir(), "Dataset", "Cleaned")
+
+    @classmethod
+    def get_preprocessed_dir(cls) -> str:
+        """Returns path to preprocessed outputs in Google Drive."""
+        path = os.path.join(cls.get_base_dir(), "Preprocessed")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    @classmethod
+    def get_logs_dir(cls) -> str:
+        """Returns path to logs directory in Google Drive."""
+        path = os.path.join(cls.get_base_dir(), "Logs")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    @classmethod
+    def get_documentation_dir(cls) -> str:
+        """Returns path to documentation directory in Google Drive."""
+        path = os.path.join(cls.get_base_dir(), "Documentation")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    @classmethod
     def get_experiment_dir(cls, model_index: int) -> str:
-        """Returns the isolated experiment folder path for a selected model (1-10)."""
+        """Returns isolated experiment directory for a selected model: Experiments/<Model_Name>/"""
         if model_index not in cls.MODEL_MAP:
-            raise ValueError(f"Invalid model index {model_index}. Must be between 1 and 10.")
+            raise ValueError(f"Invalid model index {model_index}. Choice must be between 1 and {len(cls.MODEL_MAP)}.")
         folder_name, _ = cls.MODEL_MAP[model_index]
-        return os.path.join(cls.get_base_dir(), "Experiments", folder_name)
+        path = os.path.join(cls.get_base_dir(), "Experiments", folder_name)
+        os.makedirs(path, exist_ok=True)
+        return path
 
     @classmethod
-    def get_dataset_dir(cls, sub_split: str = "Raw") -> str:
-        """Returns dataset sub-directory path."""
-        return os.path.join(cls.get_base_dir(), "Dataset", sub_split)
-
-    @classmethod
-    def get_ensemble_dir(cls) -> str:
-        """Returns ensemble experiment directory."""
-        return os.path.join(cls.get_base_dir(), "Experiments", "Ensemble")
-
-    @classmethod
-    def get_deployment_dir(cls) -> str:
-        """Returns deployment package directory."""
-        return os.path.join(cls.get_base_dir(), "Deployment")
+    def get_comparison_dir(cls) -> str:
+        """Returns comparison directory for global model benchmarking: Experiments/Comparison/"""
+        path = os.path.join(cls.get_base_dir(), "Experiments", "Comparison")
+        os.makedirs(path, exist_ok=True)
+        return path

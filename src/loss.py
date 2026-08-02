@@ -1,51 +1,71 @@
 """
 Cashew Pest and Disease Diagnosis System
-Custom Loss Functions for Class Imbalance (Weighted CrossEntropy & Focal Loss)
+Phase 3: Custom Loss Functions Engine (TensorFlow / Keras)
+Supports Categorical Crossentropy and Categorical Focal Loss for Class Imbalance
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import tensorflow as tf
+from tensorflow import keras
 
-class FocalLoss(nn.Module):
+
+class CategoricalFocalLoss(keras.losses.Loss):
     """
-    Focal Loss for addressing extreme class imbalance.
-    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    Categorical Focal Loss for handling severe class imbalance in vision models.
+    
+    FL(p_t) = -alpha * (1 - p_t)^gamma * log(p_t)
+    
+    Compatible with Keras class_weight and sample_weight.
+    Returns per-element loss tensor of shape (batch_size, num_classes) so Keras
+    compile_loss can apply sample_weight / class_weight elementwise before batch reduction.
     """
-    def __init__(self, alpha: torch.Tensor = None, gamma: float = 2.0, reduction: str = 'mean'):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha: float = 0.25,
+        reduction: str = keras.losses.Reduction.AUTO,
+        name: str = "categorical_focal_loss",
+        **kwargs
+    ):
+        super().__init__(reduction=reduction, name=name, **kwargs)
+        self.gamma = float(gamma)
+        self.alpha = float(alpha)
 
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha.to(inputs.device) if self.alpha is not None else None)
-        pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+    def call(self, y_true, y_pred):
+        # Cast y_true to match y_pred dtype for mixed_float16 precision safety
+        y_true = tf.cast(y_true, dtype=y_pred.dtype)
 
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        return focal_loss
+        # Clip predictions to prevent numerical instability (log(0))
+        epsilon = keras.backend.epsilon()
+        y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
+        
+        # Calculate per-element cross entropy: shape (batch_size, num_classes)
+        cross_entropy = -y_true * tf.math.log(y_pred)
 
-def get_loss_function(
-    class_weights: torch.Tensor = None,
-    use_focal_loss: bool = False,
-    device: torch.device = torch.device("cpu")
-) -> nn.Module:
+        # Calculate per-element focal weight: shape (batch_size, num_classes)
+        focal_weight = self.alpha * tf.math.pow(1.0 - y_pred, self.gamma)
+        
+        # Return per-element focal loss tensor of shape (batch_size, num_classes).
+        # Keras compile_loss automatically multiplies this by sample_weight/class_weight
+        # of shape (batch_size, num_classes) and applies SUM_OVER_BATCH_SIZE reduction.
+        return focal_weight * cross_entropy
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "gamma": self.gamma,
+            "alpha": self.alpha
+        })
+        return config
+
+
+def get_loss_function(loss_name: str = "categorical_crossentropy", gamma: float = 2.0, alpha: float = 0.25):
     """
-    Automatically selects the optimal loss function based on class balance.
+    Loss function selector for Keras model compilation.
     """
-    if class_weights is not None:
-        class_weights = class_weights.to(device)
-
-    if use_focal_loss:
-        print("[LOSS CONFIG] Selected: Focal Loss (gamma=2.0)")
-        return FocalLoss(alpha=class_weights)
-    elif class_weights is not None:
-        print("[LOSS CONFIG] Selected: Class-Weighted CrossEntropyLoss")
-        return nn.CrossEntropyLoss(weight=class_weights)
+    name_lower = loss_name.lower()
+    if name_lower in ["categorical_crossentropy", "crossentropy", "ce"]:
+        return keras.losses.CategoricalCrossentropy(label_smoothing=0.1)
+    elif name_lower in ["focal_loss", "focal", "fl"]:
+        return CategoricalFocalLoss(gamma=gamma, alpha=alpha)
     else:
-        print("[LOSS CONFIG] Selected: Standard CrossEntropyLoss")
-        return nn.CrossEntropyLoss()
+        raise ValueError(f"Unsupported loss function name: '{loss_name}'. Options: ['categorical_crossentropy', 'focal_loss']")

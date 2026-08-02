@@ -1,259 +1,278 @@
 """
 Cashew Pest and Disease Diagnosis System
-Modular 2-Stage Transfer Learning Trainer
+Phase 3: Modular Training Engine (TensorFlow / Keras)
+Two-Stage Fine-Tuning, Optimizer Selector, Callbacks, Mixed Precision & Artifact Saving
 """
 
 import os
-import time
-import logging
-from typing import Dict, Tuple
-
-import numpy as np
-import pandas as pd
+import json
 import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
 
-import torch
-import torch.nn as nn
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+import tensorflow as tf
+from tensorflow import keras
 
 from src.config import Config
-from src.utils import set_seed, get_logger, get_optimal_batch_size, count_parameters, get_model_size_mb
-from src.dataset import prepare_dataset_splits, get_dataloaders
-from src.models import VisionModelFactory
+from src.utils import set_seed, get_logger, get_optimal_batch_size
+from src.dataset import create_reproducible_splits, build_tf_data_pipelines
+from src.models import build_keras_model, unfreeze_model_backbone
 from src.loss import get_loss_function
 
+logger = get_logger("TrainingEngine")
+
+
+# ---------------------------------------------------------
+# Optimizer Factory
+# ---------------------------------------------------------
+def get_optimizer(optimizer_name: str = "adam", learning_rate: float = 1e-4) -> keras.optimizers.Optimizer:
+    """
+    Constructs requested Keras optimizer.
+    Supported options: 'adam', 'adamw', 'sgd'
+    """
+    name_lower = optimizer_name.lower()
+    if name_lower == "adam":
+        return keras.optimizers.Adam(learning_rate=learning_rate)
+    elif name_lower == "adamw":
+        return keras.optimizers.AdamW(learning_rate=learning_rate, weight_decay=1e-4)
+    elif name_lower == "sgd":
+        return keras.optimizers.SGD(learning_rate=learning_rate, momentum=0.9, nesterov=True)
+    else:
+        raise ValueError(f"Unsupported optimizer name: '{optimizer_name}'. Choices: ['adam', 'adamw', 'sgd']")
+
+
+# ---------------------------------------------------------
+# Training History & Curve Visualization Helpers
+# ---------------------------------------------------------
+def plot_and_save_training_curves(history_df: pd.DataFrame, experiment_dir: str):
+    """
+    Generates and saves Training & Validation Accuracy, Loss, and Learning Rate curves.
+    """
+    # 1. Loss & Accuracy Curves Plot
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Loss Curve
+    axes[0].plot(history_df['epoch'], history_df['loss'], label='Train Loss', color='#2b5c8f', linewidth=2)
+    if 'val_loss' in history_df.columns:
+        axes[0].plot(history_df['epoch'], history_df['val_loss'], label='Val Loss', color='#e07a5f', linewidth=2)
+    axes[0].set_xlabel('Epoch', fontsize=12, fontweight='bold')
+    axes[0].set_ylabel('Loss', fontsize=12, fontweight='bold')
+    axes[0].set_title('Training & Validation Loss', fontsize=14, fontweight='bold')
+    axes[0].legend()
+    axes[0].grid(True, linestyle='--', alpha=0.6)
+
+    # Accuracy Curve
+    acc_col = 'accuracy' if 'accuracy' in history_df.columns else 'categorical_accuracy'
+    val_acc_col = 'val_accuracy' if 'val_accuracy' in history_df.columns else 'val_categorical_accuracy'
+
+    if acc_col in history_df.columns:
+        axes[1].plot(history_df['epoch'], history_df[acc_col], label='Train Accuracy', color='#2b5c8f', linewidth=2)
+    if val_acc_col in history_df.columns:
+        axes[1].plot(history_df['epoch'], history_df[val_acc_col], label='Val Accuracy', color='#81b29a', linewidth=2)
+    axes[1].set_xlabel('Epoch', fontsize=12, fontweight='bold')
+    axes[1].set_ylabel('Accuracy', fontsize=12, fontweight='bold')
+    axes[1].set_title('Training & Validation Accuracy', fontsize=14, fontweight='bold')
+    axes[1].legend()
+    axes[1].grid(True, linestyle='--', alpha=0.6)
+
+    plt.tight_layout()
+    curves_path = os.path.join(experiment_dir, "training_curves.png")
+    plt.savefig(curves_path, dpi=300)
+    plt.close()
+    logger.info(f"[ARTIFACT SAVED] Training curves saved to: {curves_path}")
+
+    # 2. Learning Rate Progression Plot
+    if 'lr' in history_df.columns:
+        plt.figure(figsize=(8, 4))
+        plt.plot(history_df['epoch'], history_df['lr'], label='Learning Rate', color='#3d405b', linewidth=2)
+        plt.xlabel('Epoch', fontsize=12, fontweight='bold')
+        plt.ylabel('Learning Rate', fontsize=12, fontweight='bold')
+        plt.title('Learning Rate Schedule Progression', fontsize=14, fontweight='bold')
+        plt.yscale('log')
+        plt.grid(True, linestyle='--', alpha=0.6)
+        plt.legend()
+        plt.tight_layout()
+
+        lr_path = os.path.join(experiment_dir, "learning_rate_curve.png")
+        plt.savefig(lr_path, dpi=300)
+        plt.close()
+        logger.info(f"[ARTIFACT SAVED] Learning rate plot saved to: {lr_path}")
+
+
+# ---------------------------------------------------------
+# Main Training Engine Function
+# ---------------------------------------------------------
 def train_model(
     model_index: int = 1,
     epochs: int = Config.EPOCHS,
+    warmup_epochs: int = Config.WARMUP_EPOCHS,
     lr: float = Config.LEARNING_RATE,
-    patience: int = Config.PATIENCE,
-    unfreeze_epoch: int = Config.UNFREEZE_EPOCH,
-    base_dir: str = None
-) -> str:
+    fine_tune_lr: float = Config.FINE_TUNE_LEARNING_RATE,
+    optimizer_name: str = Config.OPTIMIZER,
+    loss_name: str = "categorical_crossentropy",
+    patience: int = Config.PATIENCE
+):
     """
-    Executes 2-stage transfer learning training for a selected vision model (1 to 10).
-    Saves best_model, last_model, history.csv, training_log.txt, accuracy.png, loss.png.
+    Executes the complete Phase 3 TensorFlow/Keras Training Pipeline:
+      1. Hardware check & Mixed Precision activation (if GPU is present).
+      2. Loads Phase 2 tf.data pipelines and class weights.
+      3. Builds Keras model architecture with frozen backbone (Stage 1 Warmup).
+      4. Stage 1 Warmup Training: Trains top classification head.
+      5. Stage 2 Fine-Tuning: Unfreezes backbone and trains with reduced learning rate.
+      6. Callbacks: EarlyStopping, ReduceLROnPlateau, ModelCheckpoint (.keras), CSVLogger, TensorBoard.
+      7. Exports all artifacts, plots, and metrics to Google Drive Experiments/<Model_Name>/.
     """
+    # 1. System Setup & GPU Mixed Precision Activation
     set_seed(Config.SEED)
-    device = Config.DEVICE
+    
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        logger.info(f"[HARDWARE DETECTED] GPU Available: {[gpu.name for gpu in gpus]}")
+        tf.keras.mixed_precision.set_global_policy('mixed_float16')
+        logger.info("[MIXED PRECISION] Global policy set to 'mixed_float16'")
+    else:
+        logger.info("[HARDWARE DETECTED] CPU Mode active.")
 
-    # 1. Resolve experiment folder & paths
-    if base_dir is None:
-        base_dir = Config.get_base_dir()
+    # Resolve Experiment Output Folder in Google Drive
+    experiment_dir = Config.get_experiment_dir(model_index)
+    folder_name, model_key = Config.MODEL_MAP[model_index]
+    logger.info(f"=== Starting Training Experiment for Model #{model_index}: {folder_name} ===")
+    logger.info(f"Experiment Artifact Directory: {experiment_dir}")
 
-    folder_name, raw_model_name = Config.MODEL_MAP[model_index]
-    exp_dir = os.path.join(base_dir, "Experiments", folder_name)
-    os.makedirs(exp_dir, exist_ok=True)
+    # 2. Load Phase 2 Dataset & TensorFlow Data Pipelines
+    split_info = create_reproducible_splits(seed=Config.SEED)
+    batch_size = get_optimal_batch_size()
+    tf_pipelines = build_tf_data_pipelines(split_info, batch_size=batch_size)
 
-    log_file = os.path.join(exp_dir, "training_log.txt")
-    logger = get_logger(f"Train_{folder_name}", log_file=log_file)
+    train_ds = tf_pipelines["train"]
+    val_ds = tf_pipelines["val"]
+    
+    num_classes = len(split_info["class_names"])
+    
+    # Format class weights dictionary for Keras fit()
+    class_weights_dict = {i: float(w) for i, w in enumerate(split_info["class_weights"])}
+    logger.info(f"Loaded Class Weights for Training: {class_weights_dict}")
 
-    logger.info("=" * 60)
-    logger.info(f"STARTING EXPERIMENT: [{folder_name}] (Model: {raw_model_name})")
-    logger.info(f"Target Directory: {exp_dir}")
-    logger.info("=" * 60)
+    # 3. Define Callbacks & Save Paths
+    best_model_path = os.path.join(experiment_dir, "best_model.keras")
+    history_csv_path = os.path.join(experiment_dir, "history.csv")
+    tensorboard_dir = os.path.join(experiment_dir, "logs")
 
-    start_time = time.time()
+    callbacks_list = [
+        keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            patience=patience,
+            restore_best_weights=True,
+            verbose=1
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=Config.REDUCE_LR_PATIENCE,
+            min_lr=1e-7,
+            verbose=1
+        ),
+        keras.callbacks.ModelCheckpoint(
+            filepath=best_model_path,
+            monitor="val_loss",
+            save_best_only=True,
+            verbose=1
+        ),
+        keras.callbacks.CSVLogger(
+            filename=history_csv_path,
+            separator=",",
+            append=False
+        ),
+        keras.callbacks.TensorBoard(
+            log_dir=tensorboard_dir,
+            histogram_freq=1
+        )
+    ]
 
-    # 2. Data Preparation
-    split_info = prepare_dataset_splits(base_dir=base_dir, seed=Config.SEED)
-    batch_size = get_optimal_batch_size(raw_model_name)
-    logger.info(f"Automatically selected Batch Size: {batch_size} for GPU/CPU setup.")
+    # 4. Stage 1: Warmup Training (Frozen Backbone)
+    logger.info(f"\n--- STAGE 1: WARMUP TRAINING ({warmup_epochs} Epochs, Frozen Backbone) ---")
+    model = build_keras_model(
+        model_index=model_index,
+        num_classes=num_classes,
+        input_shape=(224, 224, 3),
+        trainable_backbone=False
+    )
 
-    loaders = get_dataloaders(split_info, batch_size=batch_size, use_weighted_sampler=True)
-    train_loader = loaders["train"]
-    val_loader = loaders["val"]
+    optimizer = get_optimizer(optimizer_name, learning_rate=lr)
+    loss_fn = get_loss_function(loss_name)
 
-    # 3. Model Initialization (Phase 1: Frozen Backbone)
-    model = VisionModelFactory.create_model(
-        model_name=raw_model_name,
-        num_classes=len(split_info["class_names"]),
-        pretrained=True,
-        freeze_backbone=True
-    ).to(device)
+    model.compile(
+        optimizer=optimizer,
+        loss=loss_fn,
+        metrics=["categorical_accuracy"]
+    )
+    
+    model.summary(print_fn=logger.info)
 
-    # Save model summary text
-    param_info = count_parameters(model)
-    model_size_mb = get_model_size_mb(model)
-    summary_txt_path = os.path.join(exp_dir, "model_summary.txt")
-    with open(summary_txt_path, "w", encoding="utf-8") as f:
-        f.write(f"Model Name: {raw_model_name}\n")
-        f.write(f"Total Parameters: {param_info['total_parameters']:,}\n")
-        f.write(f"Trainable Parameters: {param_info['trainable_parameters']:,}\n")
-        f.write(f"Non-Trainable Parameters: {param_info['non_trainable_parameters']:,}\n")
-        f.write(f"Estimated Model Size: {model_size_mb:.2f} MB\n\n")
-        f.write(str(model))
-    logger.info(f"Saved model summary to {summary_txt_path}")
+    history_warmup = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=warmup_epochs,
+        class_weight=class_weights_dict,
+        callbacks=callbacks_list,
+        verbose=1
+    )
 
-    # 4. Optimizer, Scheduler, and Loss Setup
-    criterion = get_loss_function(class_weights=split_info["class_weights"], device=device)
-    optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=Config.WEIGHT_DECAY)
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    # 5. Stage 2: Fine-Tuning (Unfrozen Backbone)
+    remaining_epochs = max(0, epochs - warmup_epochs)
+    if remaining_epochs > 0:
+        logger.info(f"\n--- STAGE 2: FINE-TUNING ({remaining_epochs} Remaining Epochs, Unfrozen Backbone) ---")
+        model = unfreeze_model_backbone(model)
 
-    # Tracking metrics
-    history = {
-        "epoch": [], "train_loss": [], "train_acc": [],
-        "val_loss": [], "val_acc": [], "lr": []
-    }
+        fine_tune_optimizer = get_optimizer(optimizer_name, learning_rate=fine_tune_lr)
+        model.compile(
+            optimizer=fine_tune_optimizer,
+            loss=loss_fn,
+            metrics=["categorical_accuracy"]
+        )
 
-    best_val_loss = float("inf")
-    patience_counter = 0
+        # Update CSVLogger callback to append history for Stage 2
+        callbacks_list[3] = keras.callbacks.CSVLogger(
+            filename=history_csv_path,
+            separator=",",
+            append=True
+        )
 
-    best_model_path = os.path.join(exp_dir, "best_model.pth")
-    best_keras_path = os.path.join(exp_dir, "best_model.keras")
-    last_model_path = os.path.join(exp_dir, "last_model.pth")
-    last_keras_path = os.path.join(exp_dir, "last_model.keras")
+        history_finetune = model.fit(
+            train_ds,
+            validation_data=val_ds,
+            initial_epoch=warmup_epochs,
+            epochs=epochs,
+            class_weight=class_weights_dict,
+            callbacks=callbacks_list,
+            verbose=1
+        )
 
-    # 5. Training Loop
-    logger.info(f"[STAGE 1] Training Classifier Head for {epochs} max epochs...")
+    logger.info("[TRAINING COMPLETE] Best model checkpoint saved to: " + best_model_path)
 
-    for epoch in range(1, epochs + 1):
-        # Unfreeze backbone after unfreeze_epoch for Phase 2 Fine-Tuning
-        if epoch == unfreeze_epoch + 1:
-            logger.info(f"[STAGE 2] Epoch {epoch}: Unfreezing backbone for full fine-tuning...")
-            VisionModelFactory.set_backbone_trainable(model, trainable=True)
-            # Re-initialize optimizer to include newly unfrozen backbone parameters with reduced learning rate
-            optimizer = AdamW(model.parameters(), lr=lr * 0.1, weight_decay=Config.WEIGHT_DECAY)
-            scheduler = CosineAnnealingLR(optimizer, T_max=(epochs - unfreeze_epoch), eta_min=1e-7)
+    # 6. Export Training Curves & Summary Report
+    if os.path.exists(history_csv_path):
+        history_df = pd.read_csv(history_csv_path)
+        plot_and_save_training_curves(history_df, experiment_dir)
 
-        # Training Step
-        model.train()
-        running_loss = 0.0
-        correct_train = 0
-        total_train = 0
+        best_val_acc = float(history_df['val_categorical_accuracy'].max()) if 'val_categorical_accuracy' in history_df.columns else float(history_df['val_accuracy'].max())
+        min_val_loss = float(history_df['val_loss'].min())
 
-        for images, labels in train_loader:
-            images, labels = images.to(device), labels.to(device)
+        summary = {
+            "model_index": model_index,
+            "model_name": folder_name,
+            "model_key": model_key,
+            "total_epochs_trained": len(history_df),
+            "best_validation_accuracy": best_val_acc,
+            "minimum_validation_loss": min_val_loss,
+            "optimizer": optimizer_name,
+            "initial_learning_rate": lr,
+            "fine_tune_learning_rate": fine_tune_lr,
+            "best_model_path": best_model_path,
+            "history_csv_path": history_csv_path
+        }
 
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item() * images.size(0)
-            _, preds = torch.max(outputs, 1)
-            correct_train += (preds == labels).sum().item()
-            total_train += labels.size(0)
-
-        scheduler.step()
-
-        train_loss = running_loss / total_train
-        train_acc = (correct_train / total_train) * 100.0
-
-        # Validation Step
-        model.eval()
-        val_running_loss = 0.0
-        correct_val = 0
-        total_val = 0
-
-        with torch.no_grad():
-            for images, labels in val_loader:
-                images, labels = images.to(device), labels.to(device)
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-
-                val_running_loss += loss.item() * images.size(0)
-                _, preds = torch.max(outputs, 1)
-                correct_val += (preds == labels).sum().item()
-                total_val += labels.size(0)
-
-        val_loss = val_running_loss / total_val
-        val_acc = (correct_val / total_val) * 100.0
-        current_lr = optimizer.param_groups[0]['lr']
-
-        # Log epoch progress
-        history["epoch"].append(epoch)
-        history["train_loss"].append(train_loss)
-        history["train_acc"].append(train_acc)
-        history["val_loss"].append(val_loss)
-        history["val_acc"].append(val_acc)
-        history["lr"].append(current_lr)
-
-        logger.info(f"Epoch [{epoch:02d}/{epochs:02d}] | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}% | "
-                    f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}% | LR: {current_lr:.6f}")
-
-        # Checkpoint Saving: Best Model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_loss,
-                'val_acc': val_acc,
-                'class_to_idx': split_info["class_to_idx"]
-            }, best_model_path)
-            # Create Keras format alias file as requested
-            with open(best_keras_path, "w") as kf:
-                kf.write(f"PyTorch Checkpoint Export Alias for {raw_model_name} best_model.pth\n")
-            logger.info(f"  -> Best model checkpoint saved to: {best_model_path}")
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                logger.info(f"[EARLY STOPPING TRIGGERED] Validation loss did not improve for {patience} consecutive epochs.")
-                break
-
-    # Save Last Model Checkpoint
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'val_loss': val_loss,
-        'val_acc': val_acc
-    }, last_model_path)
-    with open(last_keras_path, "w") as kf:
-        kf.write(f"PyTorch Checkpoint Export Alias for {raw_model_name} last_model.pth\n")
-
-    elapsed_time = time.time() - start_time
-    time_str = f"Total Training Time: {elapsed_time:.2f} seconds ({elapsed_time/60.0:.2f} minutes)"
-    logger.info(time_str)
-
-    with open(os.path.join(exp_dir, "training_time.txt"), "w") as tf:
-        tf.write(time_str + "\n")
-
-    # 6. Save history.csv
-    df_history = pd.DataFrame(history)
-    history_csv_path = os.path.join(exp_dir, "history.csv")
-    df_history.to_csv(history_csv_path, index=False)
-    logger.info(f"Saved training history to {history_csv_path}")
-
-    # 7. Plot & Save Curves (accuracy.png, loss.png)
-    plot_training_curves(df_history, exp_dir)
-
-    logger.info(f"[TRAINING SUCCESS] Completed training for {folder_name}.")
-    return exp_dir
-
-def plot_training_curves(df_history: pd.DataFrame, output_dir: str) -> None:
-    """Generates publication-quality Accuracy and Loss curves."""
-    epochs = df_history["epoch"]
-
-    # Accuracy Plot
-    plt.figure(figsize=(8, 5))
-    plt.plot(epochs, df_history["train_acc"], 'b-o', label="Training Accuracy", linewidth=2)
-    plt.plot(epochs, df_history["val_acc"], 'r-s', label="Validation Accuracy", linewidth=2)
-    plt.title("Model Accuracy Curve", fontsize=14, fontweight='bold')
-    plt.xlabel("Epoch", fontsize=12)
-    plt.ylabel("Accuracy (%)", fontsize=12)
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.legend(fontsize=11)
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "accuracy.png"), dpi=300)
-    plt.close()
-
-    # Loss Plot
-    plt.figure(figsize=(8, 5))
-    plt.plot(epochs, df_history["train_loss"], 'b-o', label="Training Loss", linewidth=2)
-    plt.plot(epochs, df_history["val_loss"], 'r-s', label="Validation Loss", linewidth=2)
-    plt.title("Model Loss Curve", fontsize=14, fontweight='bold')
-    plt.xlabel("Epoch", fontsize=12)
-    plt.ylabel("Loss", fontsize=12)
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.legend(fontsize=11)
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "loss.png"), dpi=300)
-    plt.close()
-
-if __name__ == "__main__":
-    train_model(model_index=1, epochs=5)
+        summary_json_path = os.path.join(experiment_dir, "experiment_summary.json")
+        with open(summary_json_path, "w") as f:
+            json.dump(summary, f, indent=4)
+        logger.info(f"[SUMMARY SAVED] Experiment summary saved to: {summary_json_path}")
