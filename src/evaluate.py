@@ -6,6 +6,10 @@ Computes research-grade classification metrics, confusion matrices, ROC/PR curve
 calibration errors (ECE), confidence analysis, error profiling, latency timing,
 misclassified image exports, and cross-model comparative rankings.
 
+Includes Independent Dataset Loading:
+Directly loads Preprocessed/test_split.csv when available to keep evaluation 100%
+decoupled from training, with automatic fallback to create_reproducible_splits().
+
 Includes Confidence Thresholding Policy (80% confidence requirement):
 Prevents random predictions by outputting 'Prediction Uncertain. Please upload a clearer image'
 whenever prediction confidence drops below Config.CONFIDENCE_THRESHOLD (0.80).
@@ -35,6 +39,7 @@ from sklearn.metrics import (
 
 from src.config import Config
 from src.utils import set_seed, get_logger
+from src.dataset import create_reproducible_splits
 
 # Configure dedicated evaluation loggers
 eval_log_path = os.path.join(Config.get_logs_dir(), "evaluation.log")
@@ -45,7 +50,59 @@ exc_logger = get_logger("ExceptionEngine", exception_log_path)
 
 
 # ---------------------------------------------------------
-# 1. Single Image Inference Engine with Uncertainty Protection
+# 1. Independent Test Dataset Loader
+# ---------------------------------------------------------
+def load_evaluation_test_dataset() -> Dict:
+    """
+    Loads test dataset directly from Preprocessed/test_split.csv if present,
+    making evaluation 100% independent from training execution.
+    If test_split.csv is missing, falls back to create_reproducible_splits().
+    """
+    preprocessed_dir = Config.get_preprocessed_dir()
+    test_csv_path = os.path.join(preprocessed_dir, "test_split.csv")
+
+    if os.path.exists(test_csv_path):
+        logger.info(f"Loading pre-existing test split CSV from: {test_csv_path}")
+        test_df = pd.read_csv(test_csv_path)
+        
+        test_paths = test_df["file_path"].tolist()
+
+        if "class_name" in test_df.columns:
+            unique_classes = sorted(test_df["class_name"].unique().tolist())
+            class_to_idx = {c: i for i, c in enumerate(unique_classes)}
+            idx_to_class = {i: c for i, c in enumerate(unique_classes)}
+            
+            if "label" in test_df.columns:
+                test_labels_idx = test_df["label"].values
+            else:
+                test_labels_idx = np.array([class_to_idx[c] for c in test_df["class_name"]])
+        else:
+            unique_classes = Config.DEFAULT_CLASSES
+            class_to_idx = {c: i for i, c in enumerate(unique_classes)}
+            idx_to_class = {i: c for i, c in enumerate(unique_classes)}
+            test_labels_idx = test_df["label"].values
+
+        return {
+            "test_paths": test_paths,
+            "test_labels": test_labels_idx,
+            "class_names": unique_classes,
+            "class_to_idx": class_to_idx,
+            "idx_to_class": idx_to_class
+        }
+    else:
+        logger.warning(f"Test split CSV not found at '{test_csv_path}'. Running fallback split generator...")
+        split_info = create_reproducible_splits(seed=Config.SEED)
+        return {
+            "test_paths": split_info["test_paths"],
+            "test_labels": np.array(split_info["test_labels"]),
+            "class_names": split_info["class_names"],
+            "class_to_idx": split_info["class_to_idx"],
+            "idx_to_class": split_info["idx_to_class"]
+        }
+
+
+# ---------------------------------------------------------
+# 2. Single Image Inference Engine with Uncertainty Protection
 # ---------------------------------------------------------
 def predict_single_image(model: keras.Model, image_path: str, class_names: List[str]) -> Dict:
     """
@@ -84,7 +141,7 @@ def predict_single_image(model: keras.Model, image_path: str, class_names: List[
 
 
 # ---------------------------------------------------------
-# 2. Expected Calibration Error (ECE) Calculator
+# 3. Expected Calibration Error (ECE) Calculator
 # ---------------------------------------------------------
 def compute_expected_calibration_error(
     y_true_indices: np.ndarray,
@@ -126,7 +183,7 @@ def compute_expected_calibration_error(
 
 
 # ---------------------------------------------------------
-# 3. Plotting Engine (Publication-Quality Visualizations)
+# 4. Plotting Engine (Publication-Quality Visualizations)
 # ---------------------------------------------------------
 def plot_and_save_confusion_matrices(cm_raw: np.ndarray, cm_norm: np.ndarray, class_names: List[str], save_dir: str):
     """Generates high-resolution raw and normalized confusion matrix heatmaps."""
@@ -261,7 +318,7 @@ def plot_and_save_confidence_distribution(confidences: np.ndarray, correctness: 
 
 
 # ---------------------------------------------------------
-# 4. Model Profiling & Memory Stats
+# 5. Model Profiling & Memory Stats
 # ---------------------------------------------------------
 def profile_model_information(model: keras.Model, model_file_path: str) -> Dict:
     """Calculates total/trainable parameters, file size (MB), and GPU/CPU device info."""
@@ -286,7 +343,7 @@ def profile_model_information(model: keras.Model, model_file_path: str) -> Dict:
 
 
 # ---------------------------------------------------------
-# 5. Main Single Model Evaluation Engine
+# 6. Main Single Model Evaluation Engine
 # ---------------------------------------------------------
 def evaluate_single_model(model_index: int) -> Dict:
     """
@@ -317,12 +374,12 @@ def evaluate_single_model(model_index: int) -> Dict:
 
     model.compile(loss="categorical_crossentropy", metrics=["categorical_accuracy"])
 
-    # 2. Load Phase 2 Test Dataset Split
-    split_info = create_reproducible_splits(seed=Config.SEED)
-    test_paths = split_info["test_paths"]
-    test_labels_idx = np.array(split_info["test_labels"])
-    class_names = split_info["class_names"]
-    idx_to_class = split_info["idx_to_class"]
+    # 2. Load Phase 2 Test Dataset Split (Directly from Preprocessed/test_split.csv)
+    test_data = load_evaluation_test_dataset()
+    test_paths = test_data["test_paths"]
+    test_labels_idx = np.array(test_data["test_labels"])
+    class_names = test_data["class_names"]
+    idx_to_class = test_data["idx_to_class"]
     num_classes = len(class_names)
 
     y_true_onehot = tf.one_hot(test_labels_idx, depth=num_classes).numpy()
@@ -500,7 +557,7 @@ def evaluate_single_model(model_index: int) -> Dict:
 
 
 # ---------------------------------------------------------
-# 6. Global Cross-Model Comparison & Ranking Engine
+# 7. Global Cross-Model Comparison & Ranking Engine
 # ---------------------------------------------------------
 def evaluate_all_models() -> pd.DataFrame:
     """
