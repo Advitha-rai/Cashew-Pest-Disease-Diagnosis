@@ -6,6 +6,11 @@ Computes research-grade classification metrics, confusion matrices, ROC/PR curve
 calibration errors (ECE), confidence analysis, error profiling, latency timing,
 misclassified image exports, and cross-model comparative rankings.
 
+Fixed Vectorised Batched Inference:
+Uses an optimized tf.data.Dataset pipeline and a single model.predict(test_ds, verbose=1) call
+with a fixed batch size (32). Eliminates single-image graph retracing warnings and hanging
+issues across all 8 vision architectures (including ConvNeXtTiny, EfficientNetV2, etc.).
+
 Includes Independent Dataset Loading:
 Directly loads Preprocessed/test_split.csv when available to keep evaluation 100%
 decoupled from training, with automatic fallback to create_reproducible_splits().
@@ -50,7 +55,7 @@ exc_logger = get_logger("ExceptionEngine", exception_log_path)
 
 
 # ---------------------------------------------------------
-# 1. Independent Test Dataset Loader
+# 1. Independent Test Dataset Loader & Inference Pipeline
 # ---------------------------------------------------------
 def load_evaluation_test_dataset() -> Dict:
     """
@@ -101,6 +106,30 @@ def load_evaluation_test_dataset() -> Dict:
         }
 
 
+def parse_inference_image(file_path: tf.Tensor) -> tf.Tensor:
+    """
+    Decodes, resizes to 224x224 RGB, and normalizes image pixels to [0, 1]
+    consistently with the training preprocessing pipeline.
+    """
+    img_bytes = tf.io.read_file(file_path)
+    img = tf.image.decode_jpeg(img_bytes, channels=3)
+    img = tf.image.resize(img, [Config.IMG_HEIGHT, Config.IMG_WIDTH])
+    img = tf.cast(img, tf.float32) / 255.0
+    return img
+
+
+def build_inference_dataset(image_paths: List[str], batch_size: int = Config.BATCH_SIZE) -> tf.data.Dataset:
+    """
+    Constructs an optimized, fixed-shape batched tf.data.Dataset for vectorised inference.
+    Eliminates tf.function graph retracing warnings and single-image loop overhead.
+    """
+    dataset = tf.data.Dataset.from_tensor_slices(image_paths)
+    dataset = dataset.map(parse_inference_image, num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    return dataset
+
+
 # ---------------------------------------------------------
 # 2. Single Image Inference Engine with Uncertainty Protection
 # ---------------------------------------------------------
@@ -110,10 +139,7 @@ def predict_single_image(model: keras.Model, image_path: str, class_names: List[
     If prediction confidence < Config.CONFIDENCE_THRESHOLD (80%), prevents random guessing
     and returns 'Prediction Uncertain. Please upload a clearer image'.
     """
-    img_bytes = tf.io.read_file(image_path)
-    img = tf.image.decode_jpeg(img_bytes, channels=3)
-    img = tf.image.resize(img, [Config.IMG_HEIGHT, Config.IMG_WIDTH])
-    img = tf.cast(img, tf.float32) / 255.0
+    img = parse_inference_image(image_path)
     img_batch = tf.expand_dims(img, axis=0)
 
     probs = model(img_batch, training=False).numpy()[0]
@@ -348,6 +374,7 @@ def profile_model_information(model: keras.Model, model_file_path: str) -> Dict:
 def evaluate_single_model(model_index: int) -> Dict:
     """
     Evaluates a single model from Experiments/<Model_Name>/best_model.keras on the Phase 2 test set.
+    Uses vectorised batched model.predict() on an optimized tf.data.Dataset to avoid retracing hanging.
     Includes confidence thresholding (80%) to flag uncertain predictions.
     """
     set_seed(Config.SEED)
@@ -384,26 +411,22 @@ def evaluate_single_model(model_index: int) -> Dict:
 
     y_true_onehot = tf.one_hot(test_labels_idx, depth=num_classes).numpy()
 
-    # 3. Perform Batched Inference & Measure Latency
-    logger.info(f"Running inference on {len(test_paths)} test images...")
-    y_prob_list = []
-    
-    start_time = time.time()
-    for img_p in test_paths:
-        img_bytes = tf.io.read_file(img_p)
-        img = tf.image.decode_jpeg(img_bytes, channels=3)
-        img = tf.image.resize(img, [Config.IMG_HEIGHT, Config.IMG_WIDTH])
-        img = tf.cast(img, tf.float32) / 255.0
-        img_batch = tf.expand_dims(img, axis=0)
+    # 3. Perform Vectorised Batched Inference & Measure Latency
+    batch_size = Config.BATCH_SIZE  # e.g., 32
+    logger.info(f"Building batched tf.data dataset for {len(test_paths)} test images (Batch Size = {batch_size})...")
+    test_ds = build_inference_dataset(test_paths, batch_size=batch_size)
 
-        preds = model(img_batch, training=False)
-        y_prob_list.append(preds.numpy()[0])
+    logger.info(f"Running vectorised batched inference on {len(test_paths)} test images...")
+    start_time = time.time()
+    
+    # Use ONE model.predict() call on the batched dataset with Keras batch progress bar
+    y_prob = model.predict(test_ds, verbose=1)
     
     total_inference_time = time.time() - start_time
     avg_latency_ms = (total_inference_time / len(test_paths)) * 1000.0
     throughput_fps = len(test_paths) / total_inference_time
 
-    y_prob = np.array(y_prob_list)
+    y_prob = np.array(y_prob)
     y_pred_idx = np.argmax(y_prob, axis=1)
     confidences = np.max(y_prob, axis=1)
     correctness = (y_pred_idx == test_labels_idx)
