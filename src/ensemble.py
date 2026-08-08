@@ -4,7 +4,8 @@ Phase 5: Production-Quality Soft-Voting Ensemble Engine (TensorFlow / Keras)
 
 Combines predictions from VGG16, DenseNet121, and ConvNeXtTiny using probability-level
 soft voting with validation-based constrained weight search and full evaluation reporting.
-Includes robust invalid image protection and 80% confidence thresholding.
+Includes robust invalid image protection, 80% confidence thresholding, and Complete Dataset
+descriptive classification reporting across Train + Validation + Test splits.
 """
 
 import os
@@ -696,3 +697,338 @@ def predict_ensemble_single_image(image_path: str, models: Optional[Dict[str, ke
         "model_probabilities": {name: [round(float(p), 4) for p in sub_probs[name]] for name in model_names},
         "ensemble_probabilities": [round(float(p), 4) for p in ensemble_prob]
     }
+
+
+# ---------------------------------------------------------
+# 7. Complete Dataset Descriptive Classification Reporting
+# ---------------------------------------------------------
+def evaluate_full_dataset() -> Dict:
+    """
+    Combines train_split.csv, val_split.csv, and test_split.csv into a unified dataset,
+    runs vectorised batched ensemble inference on every valid unique image, and exports
+    complete dataset reports, confusion matrices, per-class correct/total breakdowns,
+    split-wise comparisons, misclassified thumbnails, and invalid image logs to:
+    Experiments/Ensemble/Full_Dataset_Classification/
+    """
+    set_seed(Config.SEED)
+    output_dir = Config.get_full_dataset_classification_dir()
+    ensemble_dir = Config.get_ensemble_dir()
+
+    logger.info(f"\n=======================================================================")
+    logger.info(f"  PHASE 5: COMPLETE DATASET CLASSIFICATION REPORT")
+    logger.info(f"=======================================================================")
+
+    # 1. Verify and Load Train, Validation, and Test CSV Files
+    preprocessed_dir = Config.get_preprocessed_dir()
+    splits_to_load = ["train", "val", "test"]
+    split_dfs = []
+
+    train_count = 0
+    val_count = 0
+    test_count = 0
+
+    for s_name in splits_to_load:
+        c_path = os.path.join(preprocessed_dir, f"{s_name}_split.csv")
+        if not os.path.exists(c_path):
+            err_msg = f"Cannot run complete dataset evaluation. Missing split file: {c_path}"
+            exc_logger.error(err_msg)
+            raise FileNotFoundError(err_msg)
+        
+        df = pd.read_csv(c_path)
+        split_display = "Train" if s_name == "train" else ("Validation" if s_name == "val" else "Test")
+        df["split"] = split_display
+
+        if s_name == "train":
+            train_count = len(df)
+        elif s_name == "val":
+            val_count = len(df)
+        elif s_name == "test":
+            test_count = len(df)
+
+        split_dfs.append(df)
+
+    # 2. Concatenate and Deduplicate File Paths
+    combined_df = pd.concat(split_dfs, ignore_index=True)
+    combined_df = combined_df.drop_duplicates(subset=["file_path"]).reset_index(drop=True)
+    total_unique_images = len(combined_df)
+
+    logger.info(f"Dataset Concatenation Summary -> Train: {train_count}, Val: {val_count}, Test: {test_count}")
+    logger.info(f"Total Unique Images after deduplication: {total_unique_images}")
+
+    # 3. Image Safety Validation & Invalid Logging
+    all_paths = combined_df["file_path"].tolist()
+    valid_mask = []
+    invalid_logs = []
+
+    for idx, img_p in enumerate(all_paths):
+        is_val, reason = validate_image_file(img_p)
+        valid_mask.append(is_val)
+        if not is_val:
+            invalid_logs.append(f"[INVALID IMAGE #{idx+1}] Path: '{img_p}' | Reason: {reason}")
+
+    valid_mask = np.array(valid_mask)
+    valid_df = combined_df[valid_mask].reset_index(drop=True)
+    invalid_count = int(np.sum(~valid_mask))
+    valid_count = len(valid_df)
+
+    # Write invalid_images.log
+    invalid_log_path = os.path.join(output_dir, "invalid_images.log")
+    with open(invalid_log_path, "w") as f:
+        f.write(f"COMPLETE DATASET IMAGE VALIDATION REPORT\n")
+        f.write(f"Total Input Images : {total_unique_images}\n")
+        f.write(f"Valid Images       : {valid_count}\n")
+        f.write(f"Invalid Images     : {invalid_count}\n")
+        f.write(f"=" * 60 + "\n\n")
+        if invalid_logs:
+            for log_entry in invalid_logs:
+                f.write(log_entry + "\n")
+        else:
+            f.write("No invalid images detected. All dataset images passed validation.\n")
+
+    logger.info(f"Image Validation Complete -> Valid: {valid_count}, Invalid: {invalid_count} (Logged to invalid_images.log)")
+
+    if valid_count == 0:
+        err_msg = "Zero valid images found in complete dataset."
+        exc_logger.error(err_msg)
+        raise RuntimeError(err_msg)
+
+    # Determine class mappings
+    if "class_name" in valid_df.columns:
+        class_names = sorted(valid_df["class_name"].unique().tolist())
+        class_to_idx = {c: i for i, c in enumerate(class_names)}
+        idx_to_class = {i: c for i, c in enumerate(class_names)}
+        
+        if "label" in valid_df.columns:
+            valid_labels = valid_df["label"].values
+        else:
+            valid_labels = np.array([class_to_idx[c] for c in valid_df["class_name"]])
+    else:
+        class_names = Config.DEFAULT_CLASSES
+        class_to_idx = {c: i for i, c in enumerate(class_names)}
+        idx_to_class = {i: c for i, c in enumerate(class_names)}
+        valid_labels = valid_df["label"].values
+
+    valid_paths = valid_df["file_path"].tolist()
+    valid_splits = valid_df["split"].tolist()
+    num_classes = len(class_names)
+    y_true_onehot = tf.one_hot(valid_labels, depth=num_classes).numpy()
+
+    # 4. Load Models & Finalized Ensemble Weights
+    models, model_names = load_ensemble_models()
+    weights_path = os.path.join(ensemble_dir, "ensemble_weights.json")
+    if not os.path.exists(weights_path):
+        logger.warning("Ensemble weights missing. Running validation search first...")
+        weights_info = validate_and_search_ensemble_weights()
+    else:
+        with open(weights_path, "r") as f:
+            weights_info = json.load(f)
+
+    weights = weights_info["selected_weights"]
+    logger.info(f"Loaded finalized ensemble weights for complete dataset classification: {weights}")
+
+    # 5. Batched Vectorised Inference on Complete Dataset
+    batch_size = Config.BATCH_SIZE
+    full_ds = build_inference_dataset(valid_paths, batch_size=batch_size)
+
+    full_probs = {}
+    start_time = time.time()
+    for name in model_names:
+        logger.info(f"Running complete dataset batched inference for sub-model '{name}'...")
+        probs = models[name].predict(full_ds, verbose=1)
+        full_probs[name] = np.array(probs)
+
+    total_inference_time = time.time() - start_time
+    avg_latency_ms = (total_inference_time / valid_count) * 1000.0
+    throughput_fps = valid_count / total_inference_time
+
+    # 6. Soft-Voting Combination & Confidence Thresholding
+    ensemble_probs = sum(weights[name] * full_probs[name] for name in model_names)
+    ensemble_preds = np.argmax(ensemble_probs, axis=1)
+    confidences = np.max(ensemble_probs, axis=1)
+    correctness = (ensemble_preds == valid_labels)
+
+    is_uncertain_mask = confidences < Config.CONFIDENCE_THRESHOLD
+    num_uncertain = int(np.sum(is_uncertain_mask))
+    uncertain_ratio = float(num_uncertain / valid_count)
+
+    system_responses = [
+        f"Diagnosed: {idx_to_class[pred_idx]} (Confidence: {conf*100:.1f}%)" if conf >= Config.CONFIDENCE_THRESHOLD
+        else Config.UNCERTAIN_PREDICTION_MESSAGE
+        for pred_idx, conf in zip(ensemble_preds, confidences)
+    ]
+
+    # 7. Compute Classification Metrics
+    total_correct = int(np.sum(correctness))
+    total_incorrect = valid_count - total_correct
+    overall_accuracy = (total_correct / valid_count) * 100.0
+
+    precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(valid_labels, ensemble_preds, average='macro', zero_division=0)
+    precision_weighted, recall_weighted, f1_weighted, _ = precision_recall_fscore_support(valid_labels, ensemble_preds, average='weighted', zero_division=0)
+    precision_per_class, recall_per_class, f1_per_class, support_per_class = precision_recall_fscore_support(valid_labels, ensemble_preds, average=None, zero_division=0)
+
+    # 8. Export full_dataset_predictions.csv
+    pred_df = pd.DataFrame({
+        "split": valid_splits,
+        "image_path": valid_paths,
+        "actual_class": [idx_to_class[i] for i in valid_labels],
+        "predicted_class": [idx_to_class[i] for i in ensemble_preds],
+        "confidence_score": np.round(confidences, 4),
+        "is_uncertain": is_uncertain_mask,
+        "is_correct": correctness,
+        "user_display_message": system_responses
+    })
+    pred_df.to_csv(os.path.join(output_dir, "full_dataset_predictions.csv"), index=False)
+
+    # 9. Export full_dataset_per_class_results.csv
+    per_class_rows = []
+    for i, cls_name in enumerate(class_names):
+        cls_mask = (valid_labels == i)
+        total_cls = int(np.sum(cls_mask))
+        correct_cls = int(np.sum(correctness & cls_mask))
+        incorrect_cls = total_cls - correct_cls
+        acc_cls = (correct_cls / total_cls) * 100.0 if total_cls > 0 else 0.0
+        
+        unc_cls = int(np.sum(is_uncertain_mask & cls_mask))
+        unc_pct_cls = (unc_cls / total_cls) * 100.0 if total_cls > 0 else 0.0
+
+        per_class_rows.append({
+            "Actual Class": cls_name,
+            "Correct": correct_cls,
+            "Incorrect": incorrect_cls,
+            "Total": total_cls,
+            "Accuracy": round(acc_cls, 2),
+            "Uncertain Count": unc_cls,
+            "Uncertain Percentage": round(unc_pct_cls, 2),
+            "formatted_result": f"{cls_name:<13}: {correct_cls} / {total_cls} = {acc_cls:.2f}%"
+        })
+
+    per_class_df = pd.DataFrame(per_class_rows)
+    per_class_df.drop(columns=["formatted_result"]).to_csv(os.path.join(output_dir, "full_dataset_per_class_results.csv"), index=False)
+
+    # 10. Export Separate Split Results CSV (full_dataset_split_results.csv)
+    split_results_rows = []
+    for split_label in ["Train", "Validation", "Test"]:
+        s_mask = (valid_df["split"] == split_label).values
+        s_total = int(np.sum(s_mask))
+        if s_total > 0:
+            s_corr = int(np.sum(correctness & s_mask))
+            s_inc = s_total - s_corr
+            s_acc = (s_corr / s_total) * 100.0
+            s_unc = int(np.sum(is_uncertain_mask & s_mask))
+            s_unc_pct = (s_unc / s_total) * 100.0
+        else:
+            s_corr = s_inc = s_acc = s_unc = s_unc_pct = 0.0
+
+        split_results_rows.append({
+            "split": split_label,
+            "total_images": s_total,
+            "correct": s_corr,
+            "incorrect": s_inc,
+            "accuracy": round(s_acc, 2),
+            "uncertain_count": s_unc,
+            "uncertain_percentage": round(s_unc_pct, 2)
+        })
+
+    # Complete dataset summary row
+    split_results_rows.append({
+        "split": "Complete Dataset",
+        "total_images": valid_count,
+        "correct": total_correct,
+        "incorrect": total_incorrect,
+        "accuracy": round(overall_accuracy, 2),
+        "uncertain_count": num_uncertain,
+        "uncertain_percentage": round(uncertain_ratio * 100.0, 2)
+    })
+
+    split_results_df = pd.DataFrame(split_results_rows)
+    split_results_df.to_csv(os.path.join(output_dir, "full_dataset_split_results.csv"), index=False)
+
+    # 11. Export full_dataset_summary.json
+    summary_data = {
+        "pipeline_phase": "Phase 5 - Complete Dataset Descriptive Classification",
+        "total_input_images": total_unique_images,
+        "valid_images": valid_count,
+        "invalid_images": invalid_count,
+        "train_count": train_count,
+        "validation_count": val_count,
+        "test_count": test_count,
+        "total_correct": total_correct,
+        "total_incorrect": total_incorrect,
+        "overall_accuracy": round(overall_accuracy, 2),
+        "total_uncertain": num_uncertain,
+        "uncertain_percentage": round(uncertain_ratio * 100.0, 2),
+        "per_class_results": {r["Actual Class"]: f"{r['Correct']} / {r['Total']} = {r['Accuracy']:.2f}%" for r in per_class_rows},
+        "split_wise_accuracies": {r["split"]: f"{r['accuracy']:.2f}%" for r in split_results_rows}
+    }
+
+    with open(os.path.join(output_dir, "full_dataset_summary.json"), "w") as f:
+        json.dump(summary_data, f, indent=4)
+
+    # 12. Confusion Matrices
+    cm_raw = confusion_matrix(valid_labels, ensemble_preds)
+    cm_norm = confusion_matrix(valid_labels, ensemble_preds, normalize='true')
+    plot_and_save_confusion_matrices(cm_raw, cm_norm, class_names, output_dir)
+
+    shutil.copy2(os.path.join(output_dir, "confusion_matrix.png"), os.path.join(output_dir, "full_dataset_confusion_matrix.png"))
+    shutil.copy2(os.path.join(output_dir, "confusion_matrix_normalized.png"), os.path.join(output_dir, "full_dataset_confusion_matrix_normalized.png"))
+    pd.DataFrame(cm_raw, index=class_names, columns=class_names).to_csv(os.path.join(output_dir, "full_dataset_confusion_matrix.csv"))
+
+    # 13. Classification Reports
+    clr_dict = classification_report(valid_labels, ensemble_preds, target_names=class_names, output_dict=True, zero_division=0)
+    with open(os.path.join(output_dir, "full_dataset_classification_report.json"), "w") as f:
+        json.dump(clr_dict, f, indent=4)
+
+    pd.DataFrame(clr_dict).transpose().to_csv(os.path.join(output_dir, "full_dataset_classification_report.csv"))
+
+    # 14. Misclassified Thumbnails
+    misclassified_dir = os.path.join(output_dir, "full_dataset_misclassified_images")
+    os.makedirs(misclassified_dir, exist_ok=True)
+
+    error_indices = np.where(~correctness)[0]
+    for err_idx in error_indices:
+        src_path = valid_paths[err_idx]
+        true_cls = idx_to_class[valid_labels[err_idx]]
+        pred_cls = idx_to_class[ensemble_preds[err_idx]]
+
+        img_name = os.path.basename(src_path)
+        dest_path = os.path.join(misclassified_dir, f"{true_cls}_{pred_cls}_{img_name}")
+        if os.path.exists(src_path):
+            shutil.copy2(src_path, dest_path)
+
+    # 15. Formatted Console Output
+    console_summary = f"""
+==================================================
+COMPLETE DATASET CLASSIFICATION
+==================================================
+
+Train images       : {train_count}
+Validation images  : {val_count}
+Test images        : {test_count}
+Total unique images: {total_unique_images}
+
+Valid images       : {valid_count}
+Invalid images     : {invalid_count}
+
+Correct predictions: {total_correct}
+Incorrect          : {total_incorrect}
+
+Overall accuracy   : {overall_accuracy:.2f}%
+"""
+    for r in per_class_rows:
+        console_summary += f"\n{r['Actual Class']}:\nCorrect: {r['Correct']} / {r['Total']}\nAccuracy: {r['Accuracy']:.2f}%\n"
+
+    console_summary += f"""
+==================================================
+
+IMPORTANT METHODOLOGICAL NOTE:
+
+This complete-dataset classification is descriptive because it includes training images.
+
+The official unbiased model evaluation remains the existing untouched TEST SET evaluation.
+
+==================================================
+"""
+    print(console_summary)
+    logger.info(console_summary)
+
+    return summary_data

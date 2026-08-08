@@ -63,11 +63,14 @@ python ensemble.py --validate
 # 2. Run final ensemble evaluation on untouched test set:
 python ensemble.py --test
 
-# 3. Run complete Phase 5 pipeline (Validation + Weight Selection + Test Evaluation + Comparison):
+# 3. Run complete Phase 5 pipeline (Validation + Weight Search + Test Evaluation + Comparison):
 python ensemble.py --all
 
 # 4. Perform single image ensemble prediction:
 python ensemble.py --predict path/to/sample_leaf.jpg
+
+# 5. Run complete dataset descriptive classification (Train + Validation + Test):
+python ensemble.py --full-dataset
 ```
 
 ---
@@ -96,7 +99,19 @@ Experiments/
     ├── ensemble_evaluation_summary.json      # Full evaluation summary JSON
     ├── model_comparison.csv                  # Comparative benchmark table against individual models
     ├── model_comparison.xlsx                 # Excel comparative benchmark table
-    └── misclassified_images/                 # Saved thumbnails of misclassified test images
+    ├── misclassified_images/                 # Saved thumbnails of misclassified test images
+    └── Full_Dataset_Classification/          # Complete dataset descriptive classification reports
+        ├── full_dataset_predictions.csv
+        ├── full_dataset_per_class_results.csv
+        ├── full_dataset_split_results.csv
+        ├── full_dataset_summary.json
+        ├── full_dataset_classification_report.csv
+        ├── full_dataset_classification_report.json
+        ├── full_dataset_confusion_matrix.png
+        ├── full_dataset_confusion_matrix_normalized.png
+        ├── full_dataset_confusion_matrix.csv
+        ├── full_dataset_misclassified_images/
+        └── invalid_images.log
 ```
 
 ---
@@ -107,3 +122,31 @@ Experiments/
    High softmax confidence does not guarantee out-of-distribution (OOD) safety for non-cashew images. The system mitigates this risk through input validation checks, pixel variance profiling, and the 80% uncertainty threshold.
 2. **Model Weight Preservation**:
    Sub-model checkpoints (`best_model.keras` in `03_VGG16`, `05_DenseNet121`, and `08_ConvNeXtTiny`) are read-only and were **not modified or retrained**.
+
+---
+
+## 7. Complete Dataset Classification (Phase 5 Addition)
+
+### 7.1. Purpose & Methodological Boundary
+The `evaluate_full_dataset()` reporting module combines `train_split.csv`, `val_split.csv`, and `test_split.csv` to run vectorized batched ensemble inference on **every valid unique image across the complete dataset**.
+
+> [!IMPORTANT]
+> **Methodological Boundary**:
+> Complete dataset classification is strictly **descriptive** because it includes training set images that the sub-models previously learned from.
+> - **DO NOT** refer to complete dataset accuracy as "test accuracy".
+> - The official, unbiased evaluation of generalization performance remains the **untouched test set evaluation** (`python ensemble.py --test`).
+
+### 7.2. Dataset Combination & Deduplication
+1. **Verification**: Checks existence of `train_split.csv`, `val_split.csv`, and `test_split.csv` in `Preprocessed/`.
+2. **Concatenation & Deduplication**: Concatenates splits and deduplicates file paths while tracking split origin (`Train`, `Validation`, `Test`).
+3. **Image Safety Validation**: Each image path is checked with `validate_image_file()`. Unreadable, zero-byte, or corrupted files are excluded from prediction metrics and logged in `invalid_images.log`.
+
+### 7.3. Output Artifacts (`Experiments/Ensemble/Full_Dataset_Classification/`)
+- **`full_dataset_predictions.csv`**: Contains `split`, `image_path`, `actual_class`, `predicted_class`, `confidence_score`, `is_uncertain`, `is_correct`, and `user_display_message` for every valid image.
+- **`full_dataset_per_class_results.csv`**: Per-class breakdown listing correct/total sample counts, accuracy percentages, and uncertainty counts for `Aphids`, `Leaf_Blight`, `Leaf_Miner`, and `TMB`.
+- **`full_dataset_split_results.csv`**: Split-wise performance table allowing direct comparison of classification accuracy across `Train`, `Validation`, `Test`, and `Complete Dataset`.
+- **`full_dataset_summary.json`**: Structured JSON summary containing overall classification stats, split counts, and per-class metrics.
+- **`full_dataset_confusion_matrix.png / csv`**: Full dataset raw and normalized confusion matrix visualizations.
+- **`full_dataset_classification_report.csv / json`**: Full dataset precision, recall, F1, and support report.
+- **`full_dataset_misclassified_images/`**: Saved thumbnails of misclassified images formatted as `TrueClass_PredictedClass_ImageName.jpg`.
+- **`invalid_images.log`**: Audit log recording invalid or corrupted image paths and failure reasons.

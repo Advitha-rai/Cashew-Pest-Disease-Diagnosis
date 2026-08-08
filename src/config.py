@@ -142,3 +142,10 @@ class Config:
         path = os.path.join(cls.get_base_dir(), "Experiments", "Ensemble")
         os.makedirs(path, exist_ok=True)
         return path
+
+    @classmethod
+    def get_full_dataset_classification_dir(cls) -> str:
+        """Returns directory for complete dataset classification report: Experiments/Ensemble/Full_Dataset_Classification/"""
+        path = os.path.join(cls.get_ensemble_dir(), "Full_Dataset_Classification")
+        os.makedirs(path, exist_ok=True)
+        return path
