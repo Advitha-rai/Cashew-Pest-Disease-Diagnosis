@@ -1,10 +1,11 @@
 """
 Cashew Pest and Disease Diagnosis System
-Phase 5: Global Configuration Parameters
+Phase 6: Global Configuration Parameters
 Framework: TensorFlow / Keras
 """
 
 import os
+from typing import Optional
 
 class Config:
     # ---------------------------------------------------------
@@ -149,3 +150,17 @@ class Config:
         path = os.path.join(cls.get_ensemble_dir(), "Full_Dataset_Classification")
         os.makedirs(path, exist_ok=True)
         return path
+
+    @classmethod
+    def get_individual_models_full_dataset_dir(cls, model_index: Optional[int] = None) -> str:
+        """Returns directory for Phase 6 individual models complete dataset classification."""
+        base = os.path.join(cls.get_base_dir(), "Experiments", "Individual_Models", "Full_Dataset_Classification")
+        os.makedirs(base, exist_ok=True)
+        if model_index is not None:
+            if model_index not in cls.MODEL_MAP:
+                raise ValueError(f"Invalid model index {model_index}.")
+            folder_name, _ = cls.MODEL_MAP[model_index]
+            model_dir = os.path.join(base, folder_name)
+            os.makedirs(model_dir, exist_ok=True)
+            return model_dir
+        return base
