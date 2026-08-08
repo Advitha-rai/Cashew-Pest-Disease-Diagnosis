@@ -1,6 +1,6 @@
 """
 Cashew Pest and Disease Diagnosis System
-Phase 4: Global Configuration Parameters
+Phase 5: Global Configuration Parameters
 Framework: TensorFlow / Keras
 """
 
@@ -36,6 +36,12 @@ class Config:
     }
 
     # ---------------------------------------------------------
+    # Phase 5 Ensemble Selected Sub-Models
+    # ---------------------------------------------------------
+    ENSEMBLE_MODEL_INDICES = [3, 5, 8]  # 03_VGG16, 05_DenseNet121, 08_ConvNeXtTiny
+    ENSEMBLE_MODEL_NAMES = ["VGG16", "DenseNet121", "ConvNeXtTiny"]
+
+    # ---------------------------------------------------------
     # Target Classes (Dynamic folder auto-detection fallback)
     # ---------------------------------------------------------
     DEFAULT_CLASSES = [
@@ -69,6 +75,7 @@ class Config:
     # ---------------------------------------------------------
     CONFIDENCE_THRESHOLD = 0.80  # 80% confidence requirement to avoid random guessing
     UNCERTAIN_PREDICTION_MESSAGE = "Prediction Uncertain. Please upload a clearer image"
+    INVALID_IMAGE_MESSAGE = "Invalid image. Please upload a valid cashew leaf image."
 
     # ---------------------------------------------------------
     # Dynamic Google Drive Path Resolvers
@@ -126,5 +133,12 @@ class Config:
     def get_comparison_dir(cls) -> str:
         """Returns comparison directory for global model benchmarking: Experiments/Comparison/"""
         path = os.path.join(cls.get_base_dir(), "Experiments", "Comparison")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    @classmethod
+    def get_ensemble_dir(cls) -> str:
+        """Returns output directory for Phase 5 ensemble results: Experiments/Ensemble/"""
+        path = os.path.join(cls.get_base_dir(), "Experiments", "Ensemble")
         os.makedirs(path, exist_ok=True)
         return path
