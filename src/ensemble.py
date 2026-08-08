@@ -4,7 +4,7 @@ Phase 5: Production-Quality Soft-Voting Ensemble Engine (TensorFlow / Keras)
 
 Combines predictions from VGG16, DenseNet121, and ConvNeXtTiny using probability-level
 soft voting with validation-based constrained weight search and full evaluation reporting.
-Includes robust invalid image protection, 80% confidence thresholding, and Complete Dataset
+Includes fast PIL-based parallel image validation, 80% confidence thresholding, and Complete Dataset
 descriptive classification reporting across Train + Validation + Test splits.
 """
 
@@ -18,6 +18,8 @@ import itertools
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple, Optional, Union
+from concurrent.futures import ThreadPoolExecutor
+from PIL import Image
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -49,13 +51,14 @@ exc_logger = get_logger("ExceptionEngine", exception_log_path)
 
 
 # ---------------------------------------------------------
-# 1. Image Validation & Domain Safety Profiler
+# 1. Fast Parallel Image Validation & Domain Safety Profiler
 # ---------------------------------------------------------
-def validate_image_file(image_path: str) -> Tuple[bool, str]:
+def validate_image_file_fast(image_path: str) -> Tuple[bool, str]:
     """
-    Validates single image inputs before running inference.
-    Checks file existence, readability, non-zero byte size, image decoding,
-    valid dimensions, and RGB channel integrity.
+    Fast, lightweight image validator using PIL/Pillow.
+    Checks file existence, readability, non-zero byte size, valid extensions,
+    image decodability, minimum dimensions, and RGB channel conversion.
+    Eliminates expensive per-image TensorFlow graph and reduce_std() calls.
     """
     if not os.path.exists(image_path):
         return False, f"File does not exist: {image_path}"
@@ -68,26 +71,25 @@ def validate_image_file(image_path: str) -> Tuple[bool, str]:
         return False, f"Unsupported file extension. Expected one of {valid_extensions}."
 
     try:
-        img_bytes = tf.io.read_file(image_path)
-        img = tf.image.decode_image(img_bytes, channels=3, expand_animations=False)
-        
-        shape = img.shape
-        if len(shape) != 3 or shape[2] != 3:
-            return False, "Image does not have 3 color channels (RGB)."
-        
-        if shape[0] < 10 or shape[1] < 10:
-            return False, f"Image dimensions too small: {shape[0]}x{shape[1]}."
+        with Image.open(image_path) as img:
+            width, height = img.size
+            if width < 10 or height < 10:
+                return False, f"Image dimensions too small: {width}x{height}."
+            img.verify()
 
-        # Check for empty or uniform constant pixel data
-        img_float = tf.cast(img, tf.float32)
-        std_dev = float(tf.math.reduce_std(img_float))
-        if std_dev < 1e-3:
-            return False, "Image contains uniform blank pixel data."
+        # Re-open after verify() to test RGB conversion
+        with Image.open(image_path) as img:
+            img.convert("RGB")
 
         return True, "Valid image"
 
     except Exception as e:
-        return False, f"Failed to decode image data ({str(e)})."
+        return False, f"Failed to decode image data with PIL ({str(e)})."
+
+
+def validate_image_file(image_path: str) -> Tuple[bool, str]:
+    """Alias for fast PIL-based image validation."""
+    return validate_image_file_fast(image_path)
 
 
 # ---------------------------------------------------------
@@ -199,12 +201,13 @@ def validate_and_search_ensemble_weights() -> Dict:
     # 2. Load Ensemble Models
     models, model_names = load_ensemble_models()
     batch_size = Config.BATCH_SIZE
-    val_ds = build_inference_dataset(val_paths, batch_size=batch_size)
 
-    # 3. Generate Batched Predictions for each model on Validation Set
+    # 3. Generate Batched Predictions for each model on Validation Set (Fresh Dataset per model)
     val_probs = {}
     for name in model_names:
         logger.info(f"Generating validation predictions for sub-model '{name}'...")
+        print(f"\nGenerating validation predictions for sub-model '{name}'...")
+        val_ds = build_inference_dataset(val_paths, batch_size=batch_size)
         probs = models[name].predict(val_ds, verbose=1)
         val_probs[name] = np.array(probs)
 
@@ -333,10 +336,9 @@ def evaluate_ensemble_test_set() -> Dict:
 
     y_true_onehot = tf.one_hot(test_labels, depth=num_classes).numpy()
 
-    # 3. Load Models and Run Batched Inference on Test Set
+    # 3. Load Models and Run Batched Inference on Test Set (Fresh Dataset per model)
     models, model_names = load_ensemble_models()
     batch_size = Config.BATCH_SIZE
-    test_ds = build_inference_dataset(test_paths, batch_size=batch_size)
 
     test_probs = {}
     individual_summaries = {}
@@ -344,7 +346,9 @@ def evaluate_ensemble_test_set() -> Dict:
     start_time = time.time()
     for name in model_names:
         logger.info(f"Generating test predictions for sub-model '{name}'...")
+        print(f"\nGenerating test predictions for sub-model '{name}'...")
         sub_start = time.time()
+        test_ds = build_inference_dataset(test_paths, batch_size=batch_size)
         probs = models[name].predict(test_ds, verbose=1)
         sub_time = time.time() - sub_start
         test_probs[name] = np.array(probs)
@@ -709,7 +713,9 @@ def evaluate_full_dataset() -> Dict:
     complete dataset reports, confusion matrices, per-class correct/total breakdowns,
     split-wise comparisons, misclassified thumbnails, and invalid image logs to:
     Experiments/Ensemble/Full_Dataset_Classification/
+    Uses fast parallel ThreadPoolExecutor image validation to avoid Colab freezing.
     """
+    pipeline_start_time = time.time()
     set_seed(Config.SEED)
     output_dir = Config.get_full_dataset_classification_dir()
     ensemble_dir = Config.get_ensemble_dir()
@@ -755,21 +761,36 @@ def evaluate_full_dataset() -> Dict:
     logger.info(f"Dataset Concatenation Summary -> Train: {train_count}, Val: {val_count}, Test: {test_count}")
     logger.info(f"Total Unique Images after deduplication: {total_unique_images}")
 
-    # 3. Image Safety Validation & Invalid Logging
+    # 3. Fast Parallel Image Validation & Invalid Logging (ThreadPoolExecutor)
+    val_start_time = time.time()
+    logger.info(f"Validating {total_unique_images} dataset images using parallel ThreadPoolExecutor...")
+    print(f"\nValidating {total_unique_images} dataset images using parallel ThreadPoolExecutor...")
+
     all_paths = combined_df["file_path"].tolist()
-    valid_mask = []
+    valid_mask = [False] * total_unique_images
     invalid_logs = []
 
-    for idx, img_p in enumerate(all_paths):
-        is_val, reason = validate_image_file(img_p)
-        valid_mask.append(is_val)
-        if not is_val:
-            invalid_logs.append(f"[INVALID IMAGE #{idx+1}] Path: '{img_p}' | Reason: {reason}")
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        futures = [executor.submit(validate_image_file_fast, img_p) for img_p in all_paths]
+        for idx, future in enumerate(futures):
+            is_val, reason = future.result()
+            valid_mask[idx] = is_val
+            if not is_val:
+                invalid_logs.append(f"[INVALID IMAGE #{idx+1}] Path: '{all_paths[idx]}' | Reason: {reason}")
+            
+            # Progress logging every 500 images
+            if (idx + 1) % 500 == 0 or (idx + 1) == total_unique_images:
+                print(f"[VALIDATION] Checked {idx + 1} / {total_unique_images} images")
+                logger.info(f"[VALIDATION] Checked {idx + 1} / {total_unique_images} images")
 
+    val_elapsed_time = time.time() - val_start_time
     valid_mask = np.array(valid_mask)
     valid_df = combined_df[valid_mask].reset_index(drop=True)
     invalid_count = int(np.sum(~valid_mask))
     valid_count = len(valid_df)
+
+    print(f"Image Validation Complete -> Valid: {valid_count}, Invalid: {invalid_count} (Took {val_elapsed_time:.2f}s)")
+    logger.info(f"[VALIDATION TIME] Image Validation Complete -> Valid: {valid_count}, Invalid: {invalid_count} in {val_elapsed_time:.2f} seconds")
 
     # Write invalid_images.log
     invalid_log_path = os.path.join(output_dir, "invalid_images.log")
@@ -778,14 +799,13 @@ def evaluate_full_dataset() -> Dict:
         f.write(f"Total Input Images : {total_unique_images}\n")
         f.write(f"Valid Images       : {valid_count}\n")
         f.write(f"Invalid Images     : {invalid_count}\n")
+        f.write(f"Validation Time    : {val_elapsed_time:.2f} seconds\n")
         f.write(f"=" * 60 + "\n\n")
         if invalid_logs:
             for log_entry in invalid_logs:
                 f.write(log_entry + "\n")
         else:
             f.write("No invalid images detected. All dataset images passed validation.\n")
-
-    logger.info(f"Image Validation Complete -> Valid: {valid_count}, Invalid: {invalid_count} (Logged to invalid_images.log)")
 
     if valid_count == 0:
         err_msg = "Zero valid images found in complete dataset."
@@ -826,20 +846,26 @@ def evaluate_full_dataset() -> Dict:
     weights = weights_info["selected_weights"]
     logger.info(f"Loaded finalized ensemble weights for complete dataset classification: {weights}")
 
-    # 5. Batched Vectorised Inference on Complete Dataset
+    # 5. Batched Vectorised Inference on Complete Dataset (Fresh dataset per model)
     batch_size = Config.BATCH_SIZE
-    full_ds = build_inference_dataset(valid_paths, batch_size=batch_size)
-
     full_probs = {}
-    start_time = time.time()
+    inf_start_time = time.time()
+
     for name in model_names:
         logger.info(f"Running complete dataset batched inference for sub-model '{name}'...")
-        probs = models[name].predict(full_ds, verbose=1)
+        print(f"\nRunning complete dataset batched inference for sub-model '{name}'...")
+        model_ds = build_inference_dataset(valid_paths, batch_size=batch_size)
+        probs = models[name].predict(model_ds, verbose=1)
         full_probs[name] = np.array(probs)
 
-    total_inference_time = time.time() - start_time
-    avg_latency_ms = (total_inference_time / valid_count) * 1000.0
-    throughput_fps = valid_count / total_inference_time
+    inf_elapsed_time = time.time() - inf_start_time
+    total_pipeline_time = time.time() - pipeline_start_time
+
+    logger.info(f"[MODEL INFERENCE TIME] Batched inference completed across all 3 models in {inf_elapsed_time:.2f} seconds")
+    logger.info(f"[TOTAL PIPELINE TIME] Complete Dataset Classification finished in {total_pipeline_time:.2f} seconds")
+
+    avg_latency_ms = (inf_elapsed_time / valid_count) * 1000.0
+    throughput_fps = valid_count / inf_elapsed_time
 
     # 6. Soft-Voting Combination & Confidence Thresholding
     ensemble_probs = sum(weights[name] * full_probs[name] for name in model_names)
@@ -899,7 +925,7 @@ def evaluate_full_dataset() -> Dict:
             "Accuracy": round(acc_cls, 2),
             "Uncertain Count": unc_cls,
             "Uncertain Percentage": round(unc_pct_cls, 2),
-            "formatted_result": f"{cls_name:<13}: {correct_cls} / {total_cls} = {acc_cls:.2f}%"
+            "formatted_result": f"{cls_name:<13}: Correct: {correct_cls} / {total_cls} = {acc_cls:.2f}%"
         })
 
     per_class_df = pd.DataFrame(per_class_rows)
@@ -957,6 +983,11 @@ def evaluate_full_dataset() -> Dict:
         "overall_accuracy": round(overall_accuracy, 2),
         "total_uncertain": num_uncertain,
         "uncertain_percentage": round(uncertain_ratio * 100.0, 2),
+        "timing_stats": {
+            "validation_time_seconds": round(val_elapsed_time, 2),
+            "inference_time_seconds": round(inf_elapsed_time, 2),
+            "total_pipeline_time_seconds": round(total_pipeline_time, 2)
+        },
         "per_class_results": {r["Actual Class"]: f"{r['Correct']} / {r['Total']} = {r['Accuracy']:.2f}%" for r in per_class_rows},
         "split_wise_accuracies": {r["split"]: f"{r['accuracy']:.2f}%" for r in split_results_rows}
     }
@@ -1019,13 +1050,27 @@ Overall accuracy   : {overall_accuracy:.2f}%
 
     console_summary += f"""
 ==================================================
+SPLIT-WISE ACCURACY BREAKDOWN
+==================================================
+"""
+    for s_row in split_results_rows:
+        console_summary += f"{s_row['split']:<18}: {s_row['correct']} / {s_row['total_images']} = {s_row['accuracy']:.2f}%\n"
 
-IMPORTANT METHODOLOGICAL NOTE:
+    console_summary += f"""
+[TIMING STATS]
+  - Validation Time    : {val_elapsed_time:.2f}s
+  - Inference Time     : {inf_elapsed_time:.2f}s
+  - Total Pipeline Time: {total_pipeline_time:.2f}s
 
-This complete-dataset classification is descriptive because it includes training images.
+==================================================
+IMPORTANT METHODOLOGICAL REQUIREMENT:
 
-The official unbiased model evaluation remains the existing untouched TEST SET evaluation.
+Clearly label this result as:
+"Complete Dataset Descriptive Classification"
+because Train images were used during model training.
 
+Do NOT call complete-dataset accuracy the unbiased test accuracy.
+The official unbiased performance remains the untouched Test Set evaluation.
 ==================================================
 """
     print(console_summary)
