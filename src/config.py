@@ -164,3 +164,11 @@ class Config:
             os.makedirs(model_dir, exist_ok=True)
             return model_dir
         return base
+
+    @classmethod
+    def get_final_selection_dir(cls) -> str:
+        """Returns directory for Phase 7 final model selection results: Experiments/Final_Model_Selection/"""
+        path = os.path.join(cls.get_base_dir(), "Experiments", "Final_Model_Selection")
+        os.makedirs(path, exist_ok=True)
+        return path
+
