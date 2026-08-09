@@ -433,20 +433,8 @@ def evaluate_all_models_full_dataset() -> pd.DataFrame:
             per_cls = summary["per_class_results"]
             splits_acc = summary["split_wise_accuracies"]
 
-            comparison_rows.append({
+            row = {
                 "Model": folder_name,
-                "Aphids Correct": per_cls["Aphids"]["correct"],
-                "Aphids Total": per_cls["Aphids"]["total"],
-                "Aphids Accuracy (%)": per_cls["Aphids"]["accuracy"],
-                "Leaf_Blight Correct": per_cls["Leaf_Blight"]["correct"],
-                "Leaf_Blight Total": per_cls["Leaf_Blight"]["total"],
-                "Leaf_Blight Accuracy (%)": per_cls["Leaf_Blight"]["accuracy"],
-                "Leaf_Miner Correct": per_cls["Leaf_Miner"]["correct"],
-                "Leaf_Miner Total": per_cls["Leaf_Miner"]["total"],
-                "Leaf_Miner Accuracy (%)": per_cls["Leaf_Miner"]["accuracy"],
-                "TMB Correct": per_cls["TMB"]["correct"],
-                "TMB Total": per_cls["TMB"]["total"],
-                "TMB Accuracy (%)": per_cls["TMB"]["accuracy"],
                 "Overall Correct": summary["total_correct"],
                 "Overall Total": valid_count,
                 "Overall Accuracy (%)": summary["overall_accuracy"],
@@ -454,7 +442,15 @@ def evaluate_all_models_full_dataset() -> pd.DataFrame:
                 "Validation Accuracy (%)": splits_acc["Validation"],
                 "Test Accuracy (%)": splits_acc["Test"],
                 "Complete Dataset Accuracy (%)": splits_acc["Complete Dataset"]
-            })
+            }
+
+            for cls_name, cls_result in per_cls.items():
+                safe_name = cls_name.replace(" ", "_")
+                row[f"{safe_name} Correct"] = cls_result["correct"]
+                row[f"{safe_name} Total"] = cls_result["total"]
+                row[f"{safe_name} Accuracy (%)"] = cls_result["accuracy"]
+
+            comparison_rows.append(row)
         except Exception as e:
             msg = f"Skipping Model #{model_index} ({folder_name}) due to error: {str(e)}"
             logger.warning(msg)
