@@ -172,3 +172,15 @@ class Config:
         os.makedirs(path, exist_ok=True)
         return path
 
+    @classmethod
+    def get_explainability_dir(cls, sub_dir: Optional[str] = None) -> str:
+        """Returns directory for Phase 8 Explainability & GradCAM outputs: Experiments/Explainability/"""
+        base = os.path.join(cls.get_base_dir(), "Experiments", "Explainability")
+        os.makedirs(base, exist_ok=True)
+        if sub_dir:
+            path = os.path.join(base, sub_dir)
+            os.makedirs(path, exist_ok=True)
+            return path
+        return base
+
+

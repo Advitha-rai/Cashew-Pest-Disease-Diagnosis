@@ -81,18 +81,61 @@ def load_all_phase_metrics() -> Tuple[List[Dict], Optional[Dict]]:
                 latency_ms = p_data.get("avg_inference_time_per_image_ms", 0.0)
                 model_size_mb = p_data.get("model_size_mb", 0.0)
 
-        if os.path.exists(clr_json_path):
-            with open(clr_json_path, "r") as f:
-                c_data = json.load(f)
-                for cls_key in ["Aphids", "Leaf blight", "Leaf miner", "TMB", "Leaf_Blight", "Leaf_Miner"]:
-                    if cls_key in c_data:
-                        norm_key = cls_key.replace("_", " ").title()
-                        per_class_acc[norm_key] = c_data[cls_key].get("recall", 0.0) * 100.0
+        # Check all possible classification report paths for Phase 4 individual models
+        clr_paths = [
+            os.path.join(model_exp_dir, "classification_report.json"),
+            os.path.join(model_exp_dir, "test_classification_report.json"),
+        ]
+
+        for clr_p in clr_paths:
+            if os.path.exists(clr_p):
+                with open(clr_p, "r") as f:
+                    c_data = json.load(f)
+                    for k, v in c_data.items():
+                        if isinstance(v, dict) and "recall" in v:
+                            # Save with original key and normalized title-case key
+                            rec_val = float(v["recall"]) * 100.0
+                            per_class_acc[k] = rec_val
+                            norm_k = str(k).replace("_", " ").title()
+                            per_class_acc[norm_k] = rec_val
+
+        # Fallback to confusion_matrix.csv if per_class_acc is empty
+        if not per_class_acc and os.path.exists(cm_csv_path):
+            try:
+                cm_df = pd.read_csv(cm_csv_path, index_col=0)
+                for idx_label in cm_df.index:
+                    row_sum = cm_df.loc[idx_label].sum()
+                    diag_val = cm_df.loc[idx_label, idx_label]
+                    if row_sum > 0:
+                        rec_val = (diag_val / row_sum) * 100.0
+                        per_class_acc[str(idx_label)] = rec_val
+                        per_class_acc[str(idx_label).replace("_", " ").title()] = rec_val
+            except Exception:
+                pass
+
+        # Fallback to test_predictions.csv if per_class_acc is still empty
+        pred_csv_path = os.path.join(model_exp_dir, "test_predictions.csv")
+        if not per_class_acc and os.path.exists(pred_csv_path):
+            try:
+                p_df = pd.read_csv(pred_csv_path)
+                true_col = "true_label" if "true_label" in p_df.columns else ("actual_class" if "actual_class" in p_df.columns else None)
+                pred_col = "top_predicted_label" if "top_predicted_label" in p_df.columns else ("predicted_class" if "predicted_class" in p_df.columns else None)
+                if true_col and pred_col:
+                    for cls_val, group in p_df.groupby(true_col):
+                        correct = (group[true_col] == group[pred_col]).sum()
+                        total = len(group)
+                        if total > 0:
+                            acc_v = (correct / total) * 100.0
+                            per_class_acc[str(cls_val)] = acc_v
+                            per_class_acc[str(cls_val).replace("_", " ").title()] = acc_v
+            except Exception:
+                pass
 
         # Check model checkpoint size if missing
         checkpoint_path = os.path.join(model_exp_dir, "best_model.keras")
         if model_size_mb == 0.0 and os.path.exists(checkpoint_path):
             model_size_mb = os.path.getsize(checkpoint_path) / (1024 * 1024)
+
 
         individual_models.append({
             "model_index": idx,
