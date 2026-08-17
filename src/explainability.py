@@ -45,11 +45,10 @@ PREFERRED_CONV_LAYERS = {
     "08_ConvNeXtTiny": "stage3_block2_conv2"
 }
 
-def find_target_conv_layer(model: keras.Model, model_name: Optional[str] = None) -> Tuple[Optional[str], str, Optional[Tuple]]:
+def get_target_layer_and_container(model: keras.Model, layer_name: Optional[str] = None) -> Tuple[Optional[keras.layers.Layer], Optional[keras.Model], str]:
     """
-    Automatically identifies the target final 4D convolutional feature map layer for Grad-CAM.
-    Prefers explicit architecture layers (block5_conv3, conv5_block16_concat, stage3_block2_conv2)
-    with rank-4 fallback. Returns (layer_name, location_type, output_shape).
+    Locates the target layer and its containing model container (nested base_model vs outer model).
+    Returns (target_layer_object, container_model, location_type_str).
     """
     base_model = None
     for layer in model.layers:
@@ -57,65 +56,62 @@ def find_target_conv_layer(model: keras.Model, model_name: Optional[str] = None)
             base_model = layer
             break
 
-    pref_layer = PREFERRED_CONV_LAYERS.get(model_name) if model_name else None
-
-    # Check if preferred layer exists in base_model
-    if base_model is not None and pref_layer:
-        for layer in base_model.layers:
-            if layer.name == pref_layer:
-                try:
-                    out_s = layer.output_shape
-                    if isinstance(out_s, list):
-                        out_s = out_s[0]
-                    return layer.name, "base_model", out_s
-                except Exception:
-                    pass
-
-    # Check if preferred layer exists in outer model
-    if pref_layer:
-        for layer in model.layers:
-            if layer.name == pref_layer:
-                try:
-                    out_s = layer.output_shape
-                    if isinstance(out_s, list):
-                        out_s = out_s[0]
-                    return layer.name, "outer", out_s
-                except Exception:
-                    pass
-
-    target_layer_name = None
-    location_type = "outer"
-    target_shape = None
-
+    # 1. Search nested base_model if present
     if base_model is not None:
-        for layer in reversed(base_model.layers):
+        if layer_name:
+            for l in base_model.layers:
+                if l.name == layer_name:
+                    return l, base_model, "base_model"
+        
+        # Fallback search inside base_model for rank-4 conv layer
+        for l in reversed(base_model.layers):
             try:
-                out_shape = layer.output_shape
-                if isinstance(out_shape, list):
-                    out_shape = out_shape[0]
-                if len(out_shape) == 4 and out_shape[1] is not None and out_shape[1] > 1:
-                    target_layer_name = layer.name
-                    location_type = "base_model"
-                    target_shape = out_shape
-                    break
+                out_s = l.output_shape
+                if isinstance(out_s, list):
+                    out_s = out_s[0]
+                if len(out_s) == 4 and out_s[1] is not None and out_s[1] > 1:
+                    return l, base_model, "base_model"
             except Exception:
                 continue
 
-    if target_layer_name is None:
-        for layer in reversed(model.layers):
-            try:
-                out_shape = layer.output_shape
-                if isinstance(out_shape, list):
-                    out_shape = out_shape[0]
-                if len(out_shape) == 4 and out_shape[1] is not None and out_shape[1] > 1:
-                    target_layer_name = layer.name
-                    location_type = "outer"
-                    target_shape = out_shape
-                    break
-            except Exception:
-                continue
+    # 2. Search outer model
+    if layer_name:
+        for l in model.layers:
+            if l.name == layer_name:
+                return l, model, "outer"
 
-    return target_layer_name, location_type, target_shape
+    for l in reversed(model.layers):
+        try:
+            out_s = l.output_shape
+            if isinstance(out_s, list):
+                out_s = out_s[0]
+            if len(out_s) == 4 and out_s[1] is not None and out_s[1] > 1:
+                return l, model, "outer"
+        except Exception:
+            continue
+
+    return None, None, "unknown"
+
+
+def find_target_conv_layer(model: keras.Model, model_name: Optional[str] = None) -> Tuple[Optional[str], str, Optional[Tuple]]:
+    """
+    Automatically identifies the target final 4D convolutional feature map layer for Grad-CAM.
+    Prefers explicit architecture layers (block5_conv3, conv5_block16_concat, stage3_block2_conv2)
+    with rank-4 fallback. Returns (layer_name, location_type, output_shape).
+    """
+    pref_layer = PREFERRED_CONV_LAYERS.get(model_name) if model_name else None
+    target_layer, container, loc_type = get_target_layer_and_container(model, pref_layer)
+
+    if target_layer is not None:
+        try:
+            out_s = target_layer.output_shape
+            if isinstance(out_s, list):
+                out_s = out_s[0]
+            return target_layer.name, loc_type, out_s
+        except Exception:
+            return target_layer.name, loc_type, None
+
+    return None, "unknown", None
 
 
 # ---------------------------------------------------------
@@ -129,24 +125,32 @@ def generate_gradcam_heatmap(
 ) -> Tuple[np.ndarray, str]:
     """
     Generates a Grad-CAM heatmap for a target class index on a given input image tensor.
-    Supports both outer functional models and nested backbone Keras models safely.
+    Supports both outer functional models and nested backbone Keras models safely in Keras 3.
     Returns (heatmap, selected_layer_name).
     """
-    if layer_name is None:
-        layer_name, loc_type, _ = find_target_conv_layer(model)
+    target_layer, container, location_type = get_target_layer_and_container(model, layer_name)
 
-    base_model = None
-    for layer in model.layers:
-        if isinstance(layer, keras.Model):
-            base_model = layer
-            break
+    if target_layer is None:
+        err_msg = f"Could not locate target conv layer '{layer_name}' in model."
+        exc_logger.error(err_msg)
+        raise ValueError(err_msg)
 
-    # Build sub-model for gradient extraction
-    if base_model is not None and layer_name in [l.name for l in base_model.layers]:
-        target_conv_layer = base_model.get_layer(layer_name)
+    actual_layer_name = target_layer.name
+
+    if location_type == "base_model" and container is not None:
+        base_model = container
+        
+        # In Keras 3, resolve single input tensor safely to avoid multi-input list mismatch
+        if hasattr(base_model, "input") and not isinstance(base_model.input, (list, tuple)) and not str(type(base_model.input)).endswith("list'>"):
+            base_input = base_model.input
+        elif hasattr(base_model, "inputs") and len(base_model.inputs) > 0:
+            base_input = base_model.inputs[0]
+        else:
+            base_input = base_model.input
+
         base_sub_model = keras.Model(
-            inputs=base_model.inputs,
-            outputs=[target_conv_layer.output, base_model.output]
+            inputs=base_input,
+            outputs=[target_layer.output, base_model.output]
         )
 
         with tf.GradientTape() as tape:
@@ -156,6 +160,7 @@ def generate_gradcam_heatmap(
             conv_output, base_out = base_sub_model(img_tensor, training=False)
             tape.watch(conv_output)
 
+            # Pass base_out through remaining classification head layers of outer model
             x = base_out
             for head_layer in model.layers:
                 if head_layer != base_model and not isinstance(head_layer, keras.layers.InputLayer) and head_layer.name != "input_image":
@@ -167,27 +172,37 @@ def generate_gradcam_heatmap(
         grads = tape.gradient(loss, conv_output)
 
     else:
-        target_conv_layer = model.get_layer(layer_name)
+        # Outer model layer
+        if hasattr(model, "input") and not isinstance(model.input, (list, tuple)) and not str(type(model.input)).endswith("list'>"):
+            model_input = model.input
+        elif hasattr(model, "inputs") and len(model.inputs) > 0:
+            model_input = model.inputs[0]
+        else:
+            model_input = model.input
+
         grad_model = keras.Model(
-            inputs=model.inputs,
-            outputs=[target_conv_layer.output, model.output]
+            inputs=model_input,
+            outputs=[target_layer.output, model.output]
         )
 
         with tf.GradientTape() as tape:
             img_tensor = tf.cast(img_tensor, tf.float32)
+            tape.watch(img_tensor)
+
             conv_output, preds = grad_model(img_tensor, training=False)
+            tape.watch(conv_output)
+
             loss = preds[:, class_index]
 
         grads = tape.gradient(loss, conv_output)
 
     if grads is None:
-        # Fallback if gradient is zero or missing
         conv_out_val = conv_output[0].numpy()
         heatmap = np.mean(conv_out_val, axis=-1)
     else:
         pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-        conv_output = conv_output[0]
-        heatmap = conv_output @ pooled_grads[..., tf.newaxis]
+        conv_output_val = conv_output[0]
+        heatmap = conv_output_val @ pooled_grads[..., tf.newaxis]
         heatmap = tf.squeeze(heatmap).numpy()
 
     # Apply ReLU and normalize between 0 and 1
@@ -196,7 +211,8 @@ def generate_gradcam_heatmap(
     if max_val > 0:
         heatmap = heatmap / max_val
 
-    return heatmap, layer_name
+    return heatmap, actual_layer_name
+
 
 
 def superimpose_heatmap_overlay(
