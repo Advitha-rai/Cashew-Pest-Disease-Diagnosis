@@ -183,4 +183,16 @@ class Config:
             return path
         return base
 
+    @classmethod
+    def get_explainability_validation_dir(cls, sub_dir: Optional[str] = None) -> str:
+        """Returns directory for Phase 9 Explainability Validation outputs: Experiments/Explainability_Validation/"""
+        base = os.path.join(cls.get_base_dir(), "Experiments", "Explainability_Validation")
+        os.makedirs(base, exist_ok=True)
+        if sub_dir:
+            path = os.path.join(base, sub_dir)
+            os.makedirs(path, exist_ok=True)
+            return path
+        return base
+
+
 
