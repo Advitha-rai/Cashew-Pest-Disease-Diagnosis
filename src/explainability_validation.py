@@ -24,7 +24,7 @@ from scipy.stats import pearsonr
 from scipy.spatial.distance import cosine
 from scipy.ndimage import label as label_components
 
-import tensorflow astf
+import tensorflow as tf
 from tensorflow import keras
 
 from src.config import Config
