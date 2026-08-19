@@ -35,8 +35,14 @@ $$\text{Pest Total} = \text{Aphids Total} + \text{Leaf miner Total} + \text{TMB 
 
 $$\text{Pest Accuracy (\%)} = \left( \frac{\text{Pest Correct}}{\text{Pest Total}} \right) \times 100$$
 
-- **Cell Result Format**: `Pest Correct / Pest Total / Pest Accuracy (%)` (e.g., `2550 / 2700 / 94.44%`).
+- **Cell Result Format**: Three-line format with Excel line breaks (`wrap_text=True`):
+  ```
+  Correct: 2550
+  Total: 2700
+  Accuracy: 94.44%
+  ```
 - *Strict Rule*: Uses pooled sample counts, **NOT** an unweighted average of individual accuracies.
+
 
 ---
 

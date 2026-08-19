@@ -201,8 +201,13 @@ def calculate_overall_pests_metrics(aphids: Dict, leaf_miner: Dict, tmb: Dict) -
 
 
 def format_result_cell(correct: int, total: int, accuracy: float) -> str:
-    """Formats result as 'Correct / Total / Accuracy (%)' (e.g. '850 / 900 / 94.44%')."""
-    return f"{correct} / {total} / {accuracy:.2f}%"
+    """
+    Formats result as three separate lines with line breaks:
+      Correct: XXXXX
+      Total: XXXXX
+      Accuracy: XX.XX%
+    """
+    return f"Correct: {correct}\nTotal: {total}\nAccuracy: {accuracy:.2f}%"
 
 
 # ---------------------------------------------------------
@@ -212,7 +217,8 @@ def export_professional_excel(df: pd.DataFrame, output_excel_path: str):
     """
     Exports pandas DataFrame into a beautifully formatted Excel workbook using OpenPyXL.
       - Bold header font with soft blue fill (#D9E1F2)
-      - Centered text and numerical formatting
+      - Three-line cell formatting with text wrapping (wrap_text=True)
+      - Vertical and horizontal center alignment
       - Auto-adjusted column widths
       - Frozen header row (A2)
       - Enabled grid lines
@@ -231,7 +237,8 @@ def export_professional_excel(df: pd.DataFrame, output_excel_path: str):
     header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
     header_font = Font(name="Calibri", size=11, bold=True, color="000000")
     data_font = Font(name="Calibri", size=11, bold=False, color="000000")
-    center_align = Alignment(horizontal="center", vertical="center")
+    header_align = Alignment(horizontal="center", vertical="center")
+    center_wrap_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
     left_align = Alignment(horizontal="left", vertical="center")
 
     thin_border_side = Side(border_style="thin", color="D9D9D9")
@@ -245,7 +252,7 @@ def export_professional_excel(df: pd.DataFrame, output_excel_path: str):
         cell = ws.cell(row=1, column=col_num)
         cell.fill = header_fill
         cell.font = header_font
-        cell.alignment = center_align
+        cell.alignment = header_align
         cell.border = cell_border
 
     # 2. Write Data Rows
@@ -258,27 +265,30 @@ def export_professional_excel(df: pd.DataFrame, output_excel_path: str):
             if col_idx == 1:
                 cell.alignment = left_align
             else:
-                cell.alignment = center_align
+                cell.alignment = center_wrap_align
 
     # 3. Freeze Header Row
     ws.freeze_panes = "A2"
 
-    # 4. Auto-adjust Column Widths
+    # 4. Auto-adjust Column Widths safely with multi-line support
     for col in ws.columns:
         max_len = 0
         col_letter = get_column_letter(col[0].column)
         for cell in col:
             val_str = str(cell.value or "")
-            max_len = max(max_len, len(val_str))
-        ws.column_dimensions[col_letter].width = max(max_len + 5, 16)
+            lines = val_str.split("\n")
+            for l in lines:
+                max_len = max(max_len, len(l))
+        ws.column_dimensions[col_letter].width = max(max_len + 6, 18)
 
-    # Set row heights
-    ws.row_dimensions[1].height = 26
+    # Set row heights: 28 for header, 55 for 3-line data rows
+    ws.row_dimensions[1].height = 28
     for r in range(2, len(df) + 2):
-        ws.row_dimensions[r].height = 22
+        ws.row_dimensions[r].height = 55
 
     wb.save(output_excel_path)
     logger.info(f"Successfully saved formatted Excel workbook to: {output_excel_path}")
+
 
 
 # ---------------------------------------------------------
