@@ -194,5 +194,13 @@ class Config:
             return path
         return base
 
+    @classmethod
+    def get_overall_pest_disease_dir(cls) -> str:
+        """Returns directory for Phase 10 Overall Pest & Disease Classification Summary: Experiments/Overall_Pest_Disease_Classification/"""
+        path = os.path.join(cls.get_base_dir(), "Experiments", "Overall_Pest_Disease_Classification")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+
 
 
