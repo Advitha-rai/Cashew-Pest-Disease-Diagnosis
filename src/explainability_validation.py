@@ -29,7 +29,8 @@ from tensorflow import keras
 
 from src.config import Config
 from src.utils import set_seed, get_logger
-from src.evaluate import parse_inference_image
+from src.evaluate import parse_inference_image, build_inference_dataset
+
 from src.ensemble import load_ensemble_models
 from src.explainability import (
     generate_gradcam_heatmap, superimpose_heatmap_overlay,
