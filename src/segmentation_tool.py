@@ -3617,12 +3617,27 @@ def run_phase_c1_verification_suite() -> Dict[str, Any]:
             len(model.redo_stack) == 0
         )
 
+        stroke2_state = model.current_state.copy()
+
         model.clear_canvas()
 
-        clear_ok = (
+        clear_empty = (
             np.count_nonzero(
                 model.current_state
             ) == 0
+        )
+
+        clear_undo = (
+            model.undo_stroke()
+            and
+            np.array_equal(
+                model.current_state,
+                stroke2_state,
+            )
+        )
+
+        clear_ok = (
+            clear_empty and clear_undo
         )
 
         model.load_next_image(
