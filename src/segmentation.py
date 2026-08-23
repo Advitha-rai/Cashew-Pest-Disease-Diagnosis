@@ -625,9 +625,9 @@ def audit_segmentation_dataset() -> Dict:
 | **Segmentation Dataset Found?** | **{"YES" if seg_possible else "NO (`GROUND_TRUTH_MASKS_NOT_FOUND`)"}** |
 | **Number of Source Images** | `{total_images}` unique images (Train={leakage_info['actual_counts']['Train']}, Val={leakage_info['actual_counts']['Validation']}, Test={leakage_info['actual_counts']['Test']}) |
 | **Discovered External Mask Files** | `{len(discovered_mask_files)}` |
-| **Number of Valid Ground-Truth Masks** | `{passed_cnt}` |
-| **Number of Valid Image-Mask Pairs** | `{passed_cnt}` |
-| **Number of Pending Masks** | `{total_images - annotated_cnt}` |
+| **Number of Valid Ground-Truth Masks** | `{num_valid_pairs}` |
+| **Number of Valid Image-Mask Pairs** | `{num_valid_pairs}` |
+| **Number of Pending Masks** | `{total_images - num_valid_pairs}` |
 | **Dataset Leakage Detected?** | **{"YES (WARNING)" if leakage_info['has_leakage'] else "NO (0 Overlap)"}** |
 | **Mask Encoding** | `0=Background, 1=Aphids, 2=Leaf miner, 3=TMB, 4=Leaf blight` |
 | **Train/Validation/Test Compatibility** | Isolated & Compatible (Split files preserved) |
