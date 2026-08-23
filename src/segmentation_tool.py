@@ -1320,10 +1320,15 @@ def run_phase_c1_verification_suite() -> Dict[str, Any]:
         "test_split.csv": compute_file_hash(test_csv)
     }
 
+    files_exist = os.path.exists(train_csv) and os.path.exists(val_csv) and os.path.exists(test_csv)
+    cls_files_unchanged = bool(hashes_before == hashes_after and files_exist)
+
     return {
         "all_passed": all_passed,
         "tests": test_results,
+        "test_results": test_results,
         "failed_tests": failed_list,
+        "classification_files_unchanged": cls_files_unchanged,
         "file_hashes_before": hashes_before,
         "file_hashes_after": hashes_after,
         "hashes_unchanged": (hashes_before == hashes_after)
