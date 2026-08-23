@@ -830,6 +830,9 @@ def launch_colab_annotation_interface(
     h = payload["height"]
     img_b64 = payload["base64"]
 
+    disp_w = min(600, w)
+    disp_h = max(1, min(600 * h // w, h)) if w > 0 else 600
+
     # Safe JSON string escaping for JavaScript block
     img_path_js = json.dumps(img_path)
     curr_split_js = json.dumps(curr_split)
@@ -868,10 +871,10 @@ def launch_colab_annotation_interface(
             <button onclick="clearCanvas()" style="background:#DC3545; color:white; border:none; padding:6px 12px; border-radius:4px; cursor:pointer; font-weight:bold;">🗑️ Clear</button>
         </div>
 
-        <!-- Canvas Area -->
-        <div style="position: relative; width: {min(600, w)}px; height: {min(600 * h // w, h)}px; border:2px solid #1F497D; margin:0 auto; background:#000;">
-            <img id="bg-img" src="data:image/jpeg;base64,{img_b64}" style="width:100%; height:100%; position:absolute; top:0; left:0; pointer-events:none;">
-            <canvas id="mask-canvas" width="{w}" height="{h}" style="width:100%; height:100%; position:absolute; top:0; left:0; cursor:crosshair; touch-action:none;"></canvas>
+        <!-- Canvas Wrapper -->
+        <div id="canvas-wrapper" style="position: relative; width: {disp_w}px; height: {disp_h}px; border:2px solid #1F497D; margin:0 auto; background:#000; overflow:hidden;">
+            <img id="bg-img" src="data:image/jpeg;base64,{img_b64}" style="position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; z-index:1; object-fit:contain;">
+            <canvas id="display-canvas" width="{w}" height="{h}" style="position:absolute; left:0; top:0; width:100%; height:100%; z-index:2; pointer-events:auto; touch-action:none; cursor:crosshair;"></canvas>
         </div>
 
         <!-- Status & Action Bar -->
@@ -906,12 +909,12 @@ def launch_colab_annotation_interface(
             }}
         }}
 
-        var canvas = document.getElementById('mask-canvas');
-        var ctx = canvas.getContext('2d');
-        
+        var displayCanvas = document.getElementById('display-canvas');
+        var displayCtx = displayCanvas.getContext('2d');
+
         var maskCanvas = document.createElement('canvas');
-        maskCanvas.width = canvas.width;
-        maskCanvas.height = canvas.height;
+        maskCanvas.width = displayCanvas.width;
+        maskCanvas.height = displayCanvas.height;
         var maskCtx = maskCanvas.getContext('2d');
 
         var isDrawing = false;
@@ -926,7 +929,7 @@ def launch_colab_annotation_interface(
             undoStack.push(maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height));
             if (undoStack.length > 25) undoStack.shift();
             redoStack = [];
-            renderOverlay();
+            renderMaskOverlay();
         }}
 
         function undoStroke() {{
@@ -934,7 +937,7 @@ def launch_colab_annotation_interface(
                 redoStack.push(undoStack.pop());
                 var state = undoStack[undoStack.length - 1];
                 maskCtx.putImageData(state, 0, 0);
-                renderOverlay();
+                renderMaskOverlay();
             }}
         }}
 
@@ -943,7 +946,7 @@ def launch_colab_annotation_interface(
                 var state = redoStack.pop();
                 undoStack.push(state);
                 maskCtx.putImageData(state, 0, 0);
-                renderOverlay();
+                renderMaskOverlay();
             }}
         }}
 
@@ -964,9 +967,9 @@ def launch_colab_annotation_interface(
         }}
 
         function getPos(e) {{
-            var rect = canvas.getBoundingClientRect();
-            var scaleX = canvas.width / rect.width;
-            var scaleY = canvas.height / rect.height;
+            var rect = displayCanvas.getBoundingClientRect();
+            var scaleX = maskCanvas.width / rect.width;
+            var scaleY = maskCanvas.height / rect.height;
             var clientX = e.clientX || (e.touches && e.touches[0] ? e.touches[0].clientX : 0);
             var clientY = e.clientY || (e.touches && e.touches[0] ? e.touches[0].clientY : 0);
             return {{
@@ -975,17 +978,27 @@ def launch_colab_annotation_interface(
             }};
         }}
 
-        canvas.addEventListener('pointerdown', function(e) {{
+        displayCanvas.addEventListener('pointerdown', function(e) {{
             isDrawing = true;
-            canvas.setPointerCapture(e.pointerId);
+            displayCanvas.setPointerCapture(e.pointerId);
             draw(e);
         }});
-        canvas.addEventListener('pointermove', draw);
-        canvas.addEventListener('pointerup', function(e) {{ if(isDrawing) {{ isDrawing = false; saveState(); }} }});
-        canvas.addEventListener('pointerleave', function(e) {{ if(isDrawing) {{ isDrawing = false; saveState(); }} }});
+        displayCanvas.addEventListener('pointermove', function(e) {{
+            if (isDrawing) draw(e);
+        }});
+        displayCanvas.addEventListener('pointerup', function(e) {{
+            if (isDrawing) {{ isDrawing = false; saveState(); }}
+        }});
+        displayCanvas.addEventListener('pointerleave', function(e) {{
+            if (isDrawing) {{ isDrawing = false; saveState(); }}
+        }});
+        displayCanvas.addEventListener('pointercancel', function(e) {{
+            if (isDrawing) {{ isDrawing = false; saveState(); }}
+        }});
 
         function draw(e) {{
             if (!isDrawing) return;
+            e.preventDefault();
             var pos = getPos(e);
             maskCtx.lineWidth = brushSize;
             maskCtx.lineCap = 'round';
@@ -1004,24 +1017,24 @@ def launch_colab_annotation_interface(
                 maskCtx.arc(pos.x, pos.y, brushSize / 2, 0, Math.PI * 2);
                 maskCtx.fill();
             }}
-            renderOverlay();
+            renderMaskOverlay();
         }}
 
-        function renderOverlay() {{
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            var maskData = maskCtx.getImageData(0, 0, canvas.width, canvas.height);
-            var overlayData = ctx.createImageData(canvas.width, canvas.height);
+        function renderMaskOverlay() {{
+            displayCtx.clearRect(0, 0, displayCanvas.width, displayCanvas.height);
+            var maskData = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+            var overlayData = displayCtx.createImageData(displayCanvas.width, displayCanvas.height);
             
             for (var i = 0; i < maskData.data.length; i += 4) {{
                 var code = maskData.data[i];
                 if (code > 0) {{
-                    overlayData.data[i] = (code == 1 ? 255 : (code == 4 ? 255 : 0));
-                    overlayData.data[i+1] = (code == 2 ? 255 : (code == 4 ? 255 : 0));
-                    overlayData.data[i+2] = (code == 3 ? 255 : 0);
-                    overlayData.data[i+3] = 180; // 70% opacity visual overlay
+                    overlayData.data[i]     = (code == 1 ? 255 : (code == 4 ? 255 : 0));
+                    overlayData.data[i + 1] = (code == 2 ? 255 : (code == 4 ? 255 : 0));
+                    overlayData.data[i + 2] = (code == 3 ? 255 : 0);
+                    overlayData.data[i + 3] = 180; // 70% opacity visual overlay
                 }}
             }}
-            ctx.putImageData(overlayData, 0, 0);
+            displayCtx.putImageData(overlayData, 0, 0);
         }}
 
         function getRawMaskBase64() {{
@@ -1085,15 +1098,23 @@ def launch_colab_annotation_interface(
                 }}
             }}
             
-            canvas.width = item.width;
-            canvas.height = item.height;
+            displayCanvas.width = item.width;
+            displayCanvas.height = item.height;
             maskCanvas.width = item.width;
             maskCanvas.height = item.height;
+
+            var wrapper = document.getElementById('canvas-wrapper');
+            if (wrapper) {{
+                var dispW = Math.min(600, item.width);
+                var dispH = Math.floor(dispW * item.height / item.width);
+                wrapper.style.width = dispW + "px";
+                wrapper.style.height = dispH + "px";
+            }}
             
             undoStack = [];
             redoStack = [];
             maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            displayCtx.clearRect(0, 0, displayCanvas.width, displayCanvas.height);
             saveState();
             
             document.getElementById('btn-save').disabled = false;
