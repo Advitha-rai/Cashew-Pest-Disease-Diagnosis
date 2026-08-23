@@ -277,6 +277,44 @@ def save_json_manifest_atomically(data: Dict, json_manifest_path: str) -> None:
     os.replace(temp_name, json_manifest_path)
 
 
+def find_manifest_match_index(df_m: pd.DataFrame, image_path: str, split: Optional[str] = None) -> pd.Index:
+    """Robustly matches image_path in manifest by exact path, normalized path, endswith match, or image_name + split."""
+    if df_m.empty or "image_path" not in df_m.columns:
+        return pd.Index([])
+
+    norm_target = os.path.normpath(image_path).replace("\\", "/").lower()
+    target_base = os.path.basename(image_path).lower()
+
+    # 1. Exact match
+    exact_matches = df_m[df_m["image_path"] == image_path].index
+    if not exact_matches.empty:
+        return exact_matches
+
+    # 2. Normalized path match
+    norm_paths = df_m["image_path"].astype(str).apply(lambda p: os.path.normpath(p).replace("\\", "/").lower())
+    norm_matches = df_m[norm_paths == norm_target].index
+    if not norm_matches.empty:
+        return norm_matches
+
+    # 3. Path suffix match (relative vs absolute path)
+    suffix_matches = df_m[norm_paths.apply(lambda p: norm_target.endswith(p) or p.endswith(norm_target))].index
+    if not suffix_matches.empty:
+        return suffix_matches
+
+    # 4. Image name + split match
+    if split is not None and "image_name" in df_m.columns and "split" in df_m.columns:
+        clean_split = str(split).capitalize()
+        name_split_matches = df_m[(df_m["image_name"].astype(str).str.lower() == target_base) & (df_m["split"] == clean_split)].index
+        if not name_split_matches.empty:
+            return name_split_matches
+
+    # 5. Image name match fallback
+    if "image_name" in df_m.columns:
+        return df_m[df_m["image_name"].astype(str).str.lower() == target_base].index
+
+    return pd.Index([])
+
+
 def decode_colab_response_payload(res: Any) -> Any:
     """
     Python-side equivalent of the JS parseColabResponse behavior.
@@ -426,7 +464,7 @@ def process_annotation_submission(
         manifest_csv = os.path.join(seg_dir, "segmentation_annotation_manifest.csv")
 
     df_m = pd.read_csv(manifest_csv)
-    match_idx = df_m[(df_m["image_path"] == image_path) & (df_m["split"] == split.capitalize())].index
+    match_idx = find_manifest_match_index(df_m, image_path, split)
     if not match_idx.empty:
         idx = match_idx[0]
         if is_valid:
@@ -459,7 +497,7 @@ def mark_image_skipped(image_path: str, reason: str = "Marked for human review",
         return False
 
     df_m = pd.read_csv(manifest_csv)
-    match_idx = df_m[df_m["image_path"] == image_path].index
+    match_idx = find_manifest_match_index(df_m, image_path)
 
     if not match_idx.empty:
         idx = match_idx[0]
