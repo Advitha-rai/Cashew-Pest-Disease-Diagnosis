@@ -79,6 +79,12 @@ class Config:
     INVALID_IMAGE_MESSAGE = "Invalid image. Please upload a valid cashew leaf image."
 
     # ---------------------------------------------------------
+    # Segmentation Quality Control Thresholds
+    # ---------------------------------------------------------
+    MIN_LESION_PIXEL_PERCENTAGE = 0.01   # Minimum 0.01% of total image pixels
+    MAX_LESION_PIXEL_PERCENTAGE = 95.00  # Maximum 95% of total image pixels
+
+    # ---------------------------------------------------------
     # Dynamic Google Drive Path Resolvers
     # ---------------------------------------------------------
     @classmethod
