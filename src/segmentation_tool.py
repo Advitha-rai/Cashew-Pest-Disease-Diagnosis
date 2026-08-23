@@ -2575,7 +2575,7 @@ function skipImage() {{
                     );
             }}
 
-        })
+        }})
         .catch(function(err) {{
 
             document.getElementById(
@@ -2674,7 +2674,7 @@ function saveAndNext() {{
                     );
             }}
 
-        })
+        }})
         .catch(function(err) {{
 
             document.getElementById(
