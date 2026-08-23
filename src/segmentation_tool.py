@@ -922,6 +922,7 @@ def launch_colab_annotation_interface(
         var brushSize = 14;
         var undoStack = [];
         var redoStack = [];
+        var lastPos = null;
 
         saveState();
 
@@ -981,25 +982,38 @@ def launch_colab_annotation_interface(
         displayCanvas.addEventListener('pointerdown', function(e) {{
             isDrawing = true;
             displayCanvas.setPointerCapture(e.pointerId);
+            lastPos = getPos(e);
             draw(e);
         }});
         displayCanvas.addEventListener('pointermove', function(e) {{
             if (isDrawing) draw(e);
         }});
         displayCanvas.addEventListener('pointerup', function(e) {{
-            if (isDrawing) {{ isDrawing = false; saveState(); }}
+            if (isDrawing) {{
+                isDrawing = false;
+                lastPos = null;
+                saveState();
+            }}
         }});
         displayCanvas.addEventListener('pointerleave', function(e) {{
-            if (isDrawing) {{ isDrawing = false; saveState(); }}
+            if (isDrawing && !displayCanvas.hasPointerCapture(e.pointerId)) {{
+                isDrawing = false;
+                lastPos = null;
+                saveState();
+            }}
         }});
         displayCanvas.addEventListener('pointercancel', function(e) {{
-            if (isDrawing) {{ isDrawing = false; saveState(); }}
+            if (isDrawing) {{
+                isDrawing = false;
+                lastPos = null;
+                saveState();
+            }}
         }});
 
         function draw(e) {{
-            if (!isDrawing) return;
+            if (!isDrawing || !lastPos) return;
             e.preventDefault();
-            var pos = getPos(e);
+            var currPos = getPos(e);
             maskCtx.lineWidth = brushSize;
             maskCtx.lineCap = 'round';
             maskCtx.lineJoin = 'round';
@@ -1008,15 +1022,30 @@ def launch_colab_annotation_interface(
                 maskCtx.globalCompositeOperation = 'source-over';
                 maskCtx.fillStyle = 'rgb(' + currentCode + ',' + currentCode + ',' + currentCode + ')';
                 maskCtx.strokeStyle = maskCtx.fillStyle;
+                
                 maskCtx.beginPath();
-                maskCtx.arc(pos.x, pos.y, brushSize / 2, 0, Math.PI * 2);
+                maskCtx.moveTo(lastPos.x, lastPos.y);
+                maskCtx.lineTo(currPos.x, currPos.y);
+                maskCtx.stroke();
+                
+                maskCtx.beginPath();
+                maskCtx.arc(currPos.x, currPos.y, brushSize / 2, 0, Math.PI * 2);
                 maskCtx.fill();
             }} else {{
                 maskCtx.globalCompositeOperation = 'destination-out';
+                maskCtx.fillStyle = 'rgba(0,0,0,1)';
+                maskCtx.strokeStyle = 'rgba(0,0,0,1)';
+                
                 maskCtx.beginPath();
-                maskCtx.arc(pos.x, pos.y, brushSize / 2, 0, Math.PI * 2);
+                maskCtx.moveTo(lastPos.x, lastPos.y);
+                maskCtx.lineTo(currPos.x, currPos.y);
+                maskCtx.stroke();
+                
+                maskCtx.beginPath();
+                maskCtx.arc(currPos.x, currPos.y, brushSize / 2, 0, Math.PI * 2);
                 maskCtx.fill();
             }}
+            lastPos = currPos;
             renderMaskOverlay();
         }}
 
@@ -1413,9 +1442,26 @@ def run_phase_c1_verification_suite() -> Dict[str, Any]:
         files_exist = os.path.exists(train_csv) and os.path.exists(val_csv) and os.path.exists(test_csv)
         test_results["TEST_18_classification_files_unchanged"] = "PASS" if (hashes_before == hashes_after and files_exist) else "FAIL"
 
-        # TEST 19: Test Images Unchanged Proof
+        # TEST 19: Comprehensive Test Image Byte Preservation & Read-Only Isolation Proof
+        hash_test_img_before = compute_file_hash(dummy_test_p)
         test_row = df_m_chk2[df_m_chk2["split"] == "Test"].iloc[0]
-        test_results["TEST_19_test_images_unchanged"] = "PASS" if (test_row["annotation_status"] == "PENDING" and not os.path.exists(test_row["expected_mask_path"])) else "FAIL"
+        
+        # Attempt illegal annotation operation targeting test image
+        rej_err = None
+        try:
+            assert_annotation_allowed("Train", dummy_test_p, test_csv_path=test_csv)
+        except PermissionError as pe:
+            rej_err = str(pe)
+
+        res_test_annot = colab_save_mask_handler(dummy_test_p, valid_png_b64, "Test", "TMB", manifest_csv=temp_manifest_csv)
+        
+        hash_test_img_after = compute_file_hash(dummy_test_p)
+        bytes_preserved = (hash_test_img_before == hash_test_img_after)
+        no_mask = not os.path.exists(test_row["expected_mask_path"])
+        status_pending = (test_row["annotation_status"] == "PENDING" and test_row["validation_status"] == "UNVALIDATED")
+        rejection_ok = (rej_err is not None and res_test_annot.get("success") is False)
+
+        test_results["TEST_19_test_images_unchanged"] = "PASS" if (bytes_preserved and no_mask and status_pending and rejection_ok) else "FAIL"
 
         # TEST 20: Callback Exception Handling
         err_res = colab_save_mask_handler("/nonexistent/file.jpg", "invalid_b64", "Train", "TMB", manifest_csv=temp_manifest_csv)
@@ -1426,21 +1472,38 @@ def run_phase_c1_verification_suite() -> Dict[str, Any]:
         dup2 = register_colab_callbacks()
         test_results["TEST_21_duplicate_registration"] = "PASS" if (isinstance(dup1, dict) and isinstance(dup2, dict) and dup1.get("callbacks", {}).keys() == dup2.get("callbacks", {}).keys()) else "FAIL"
 
-        # TEST 22: Truthful Undo/Redo & State Reset Model Verification
+        # TEST 22: Truthful Undo/Redo & Behavioral Contract Verification
         model = CanvasHistoryStateModel(100, 100)
-        init_ok = (len(model.undo_stack) == 1 and len(model.redo_stack) == 0)
+        # 1. Initial state is empty
+        init_empty = (np.count_nonzero(model.current_state) == 0) and (len(model.redo_stack) == 0)
+        
+        # 2. Painting creates non-empty state
         model.paint_stroke(10, 30, 10, 30, 3)
-        stroke1_ok = (len(model.undo_stack) == 2 and np.count_nonzero(model.current_state) > 0)
-        undo_ok = model.undo_stroke() and (np.count_nonzero(model.current_state) == 0) and (len(model.redo_stack) == 1)
-        redo_ok = model.redo_stroke() and (np.count_nonzero(model.current_state) > 0) and (len(model.redo_stack) == 0)
+        stroke1_state = model.current_state.copy()
+        painted_ok = (np.count_nonzero(stroke1_state) > 0)
+        
+        # 3. Undo returns to previous state
+        undo_success = model.undo_stroke()
+        undone_empty = (np.count_nonzero(model.current_state) == 0) and (len(model.redo_stack) == 1)
+        
+        # 4. Redo restores painted state
+        redo_success = model.redo_stroke()
+        redone_match = np.array_equal(model.current_state, stroke1_state) and (len(model.redo_stack) == 0)
+        
+        # 5. Creating new stroke after undo clears redo history
         model.undo_stroke()
         model.paint_stroke(40, 50, 40, 50, 1)
-        new_stroke_clears_redo = (len(model.redo_stack) == 0)
+        redo_cleared = (len(model.redo_stack) == 0)
+        
+        # 6. Clear returns canvas to empty
         model.clear_canvas()
-        clear_ok = (np.count_nonzero(model.current_state) == 0) and (len(model.undo_stack) == 4)
-        model.load_next_image(120, 120)
-        reset_ok = (len(model.undo_stack) == 1 and len(model.redo_stack) == 0 and model.width == 120)
-        t22_pass = (init_ok and stroke1_ok and undo_ok and redo_ok and new_stroke_clears_redo and clear_ok and reset_ok)
+        clear_empty = (np.count_nonzero(model.current_state) == 0)
+        
+        # 7. Loading new image resets history and applies new dimensions
+        model.load_next_image(150, 120)
+        reset_clean = (len(model.undo_stack) == 1 and len(model.redo_stack) == 0 and model.width == 150 and model.height == 120)
+
+        t22_pass = (init_empty and painted_ok and undo_success and undone_empty and redo_success and redone_match and redo_cleared and clear_empty and reset_clean)
         test_results["TEST_22_undo_redo_state_reset"] = "PASS" if t22_pass else "FAIL"
 
         # TEST 23: Filter Preservation
