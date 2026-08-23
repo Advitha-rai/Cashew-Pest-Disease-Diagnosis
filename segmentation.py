@@ -133,14 +133,12 @@ def main():
     # 8. Pilot Option
     if args.pilot:
         print("[CLI] Launching Pilot Annotation Workflow (10 Train images per class = 40 candidate pilot images for human annotation)...")
-        launch_colab_annotation_interface(split="Train", pilot=True)
-        return
+        return launch_colab_annotation_interface(split="Train", pilot=True)
 
     # 9. Annotate Option
     if args.annotate:
         print(f"[CLI] Launching Interactive Colab Annotation Tool (Split={args.split}, Class={args.class_name})...")
-        launch_colab_annotation_interface(split=args.split, class_name=args.class_name)
-        return
+        return launch_colab_annotation_interface(split=args.split, class_name=args.class_name)
 
     # Default action: Run dry-run annotation tool setup
     print("[CLI] Executing default segmentation annotation tool setup...")

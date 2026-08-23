@@ -837,14 +837,15 @@ def launch_colab_annotation_interface(
 
         function parseColabResponse(res) {{
             if (!res) return null;
-            var data = res.data;
-            if (!data) return res;
-            if (data['application/json']) return data['application/json'];
-            if (data['text/plain']) {{
-                try {{ return JSON.parse(data['text/plain']); }}
-                catch(e) {{ return {{ success: false, message: data['text/plain'] }}; }}
+            var payload = (res && res.data) ? res.data : res;
+            var out = payload['application/json'] || payload['text/plain'] || payload;
+            if (typeof out === 'string') {{
+                try {{ out = JSON.parse(out); }} catch(e) {{}}
             }}
-            return data;
+            if (typeof out === 'string') {{
+                try {{ out = JSON.parse(out); }} catch(e) {{}}
+            }}
+            return out;
         }}
 
         function updateProgressUI(rep) {{
@@ -956,9 +957,12 @@ def launch_colab_annotation_interface(
 
     try:
         from IPython.display import HTML, display
-        display(HTML(html_code))
+        html_obj = HTML(html_code)
+        display(html_obj)
+        return html_obj
     except ImportError:
         print(f"\n[INTERACTIVE TOOL READY] Next pending image: {img_path} ({curr_split}/{curr_class})")
+        return None
 
 
 # ---------------------------------------------------------
