@@ -201,6 +201,40 @@ class Config:
         os.makedirs(path, exist_ok=True)
         return path
 
+    # ---------------------------------------------------------
+    # Hyperparameter Tuning Settings
+    # ---------------------------------------------------------
+    TUNING_SEED = 42
+    TUNING_MAX_EPOCHS = 15
+    TUNING_DEFAULT_TRIALS = 10
+    TUNING_OBJECTIVE = "val_accuracy"
+    TUNING_SEARCH_METHOD = "random"
+
+    @classmethod
+    def get_hyperparameter_tuning_dir(cls, run_id: Optional[str] = None) -> str:
+        """Returns versioned directory for Hyperparameter Tuning outputs: Experiments/Hyperparameter_Tuning/<Run_ID>/"""
+        base = os.path.join(cls.get_base_dir(), "Experiments", "Hyperparameter_Tuning")
+        os.makedirs(base, exist_ok=True)
+        if run_id:
+            path = os.path.join(base, run_id)
+            os.makedirs(path, exist_ok=True)
+            return path
+        return base
+
+    @classmethod
+    def get_segmentation_dir(cls, sub_dir: Optional[str] = None) -> str:
+        """Returns directory for Segmentation Audit and Pipeline outputs: Experiments/Segmentation/"""
+        base = os.path.join(cls.get_base_dir(), "Experiments", "Segmentation")
+        os.makedirs(base, exist_ok=True)
+        if sub_dir:
+            path = os.path.join(base, sub_dir)
+            os.makedirs(path, exist_ok=True)
+            return path
+        return base
+
+
+
+
 
 
 

@@ -276,3 +276,52 @@ def train_model(
         with open(summary_json_path, "w") as f:
             json.dump(summary, f, indent=4)
         logger.info(f"[SUMMARY SAVED] Experiment summary saved to: {summary_json_path}")
+
+        # Complete hyperparameter & reproducibility configuration export for future runs
+        full_config = {
+            "model_index": model_index,
+            "model_name": folder_name,
+            "model_key": model_key,
+            "seed": Config.SEED,
+            "optimizer": optimizer_name,
+            "initial_learning_rate": lr,
+            "fine_tune_learning_rate": fine_tune_lr,
+            "total_epochs_configured": epochs,
+            "warmup_epochs": warmup_epochs,
+            "epochs_actually_trained": len(history_df),
+            "batch_size": batch_size,
+            "early_stopping_patience": patience,
+            "reduce_lr_factor": 0.5,
+            "reduce_lr_patience": Config.REDUCE_LR_PATIENCE,
+            "minimum_learning_rate": 1e-7,
+            "loss_function": loss_name,
+            "label_smoothing": 0.1 if loss_name in ["categorical_crossentropy", "crossentropy", "ce"] else 0.0,
+            "focal_gamma": 2.0 if loss_name in ["focal_loss", "focal", "fl"] else None,
+            "focal_alpha": 0.25 if loss_name in ["focal_loss", "focal", "fl"] else None,
+            "class_weights_used": True,
+            "class_weights_dict": class_weights_dict,
+            "mixed_precision_active": bool(gpus),
+            "input_image_shape": list(Config.IMG_SIZE) + [Config.CHANNELS],
+            "split_ratios": {"train": Config.TRAIN_RATIO, "val": Config.VAL_RATIO, "test": Config.TEST_RATIO},
+            "augmentation_configuration": {
+                "horizontal_flip": True,
+                "random_brightness_delta": 0.15,
+                "random_contrast_bounds": [0.85, 1.15],
+                "gaussian_noise_stddev": 4.0
+            },
+            "regularization": {"head_dropout_rate": 0.3, "head_batch_norm": True},
+            "backbone_freezing_strategy": {
+                "stage1_warmup": f"Epochs 1 to {warmup_epochs} (Backbone Frozen)",
+                "stage2_finetune": f"Epochs {warmup_epochs+1} to {epochs} (Backbone Unfrozen)"
+            },
+            "checkpoint_monitor": "val_loss",
+            "checkpoint_mode": "min",
+            "best_validation_accuracy": best_val_acc,
+            "minimum_validation_loss": min_val_loss
+        }
+
+        config_json_path = os.path.join(experiment_dir, "training_configuration.json")
+        with open(config_json_path, "w") as f:
+            json.dump(full_config, f, indent=4)
+        logger.info(f"[CONFIG SAVED] Full training configuration saved to: {config_json_path}")
+
