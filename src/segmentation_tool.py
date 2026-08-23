@@ -537,7 +537,7 @@ def colab_callback_health_check() -> Dict:
 
 
 def colab_save_mask_handler(image_path, mask_b64, split, class_name, manifest_csv: Optional[str] = None):
-    """Global Colab handler for save_mask with filter preservation."""
+    """Global Colab handler for save_mask with filter preservation and fallback."""
     print(f"[CALLBACK] notebook.save_mask received: {image_path}")
     try:
         assert_annotation_allowed(split, image_path)
@@ -545,13 +545,20 @@ def colab_save_mask_handler(image_path, mask_b64, split, class_name, manifest_cs
         if is_valid:
             saved_p = meta.get("expected_mask_path", "")
             print(f"[SUCCESS] Mask saved:\n{saved_p}")
-            # PRESERVE ACTIVE FILTERS (split AND class_name)
+            # Resolving next pending image matching active filter with fallbacks
             next_item = get_next_pending_image(split=split, class_name=class_name, manifest_csv=manifest_csv)
+            if next_item is None and class_name is not None:
+                next_item = get_next_pending_image(split=split, class_name=None, manifest_csv=manifest_csv)
+            if next_item is None:
+                next_item = get_next_pending_image(split=None, class_name=None, manifest_csv=manifest_csv)
+
             report = get_annotation_progress_report(manifest_csv=manifest_csv)
             payload = prepare_image_payload(next_item, manifest_csv=manifest_csv) if next_item else None
             return make_json_safe({
                 "success": True,
+                "status": "ANNOTATED",
                 "message": msg,
+                "image_path": image_path,
                 "next_item": payload,
                 "progress": report
             })
@@ -559,7 +566,9 @@ def colab_save_mask_handler(image_path, mask_b64, split, class_name, manifest_cs
             print(f"[ERROR] Validation failed: {msg}")
             return make_json_safe({
                 "success": False,
+                "status": "FAILED",
                 "message": msg,
+                "image_path": image_path,
                 "next_item": None,
                 "progress": get_annotation_progress_report(manifest_csv=manifest_csv)
             })
@@ -568,26 +577,35 @@ def colab_save_mask_handler(image_path, mask_b64, split, class_name, manifest_cs
         print(f"[C1 CALLBACK ERROR] {str(e)}\n{err_detail}")
         return make_json_safe({
             "success": False,
+            "status": "ERROR",
             "message": str(e),
+            "image_path": image_path,
             "next_item": None,
             "error_type": type(e).__name__
         })
 
 
 def colab_skip_image_handler(image_path, reason="Marked for human review", split="Train", class_name=None, manifest_csv: Optional[str] = None):
-    """Global Colab handler for skip_image with filter preservation."""
+    """Global Colab handler for skip_image with filter preservation and fallback."""
     print(f"[CALLBACK] notebook.skip_image received: {image_path}")
     try:
         assert_annotation_allowed(split, image_path)
         res = mark_image_skipped(image_path, reason, manifest_csv=manifest_csv)
         print(f"[SUCCESS] Image skipped:\n{image_path}")
-        # PRESERVE ACTIVE FILTERS (split AND class_name)
+        # Resolving next pending image matching active filter with fallbacks
         next_item = get_next_pending_image(split=split, class_name=class_name, manifest_csv=manifest_csv)
+        if next_item is None and class_name is not None:
+            next_item = get_next_pending_image(split=split, class_name=None, manifest_csv=manifest_csv)
+        if next_item is None:
+            next_item = get_next_pending_image(split=None, class_name=None, manifest_csv=manifest_csv)
+
         report = get_annotation_progress_report(manifest_csv=manifest_csv)
         payload = prepare_image_payload(next_item, manifest_csv=manifest_csv) if next_item else None
         return make_json_safe({
             "success": res,
+            "status": "SKIPPED",
             "message": "Image marked skipped",
+            "image_path": image_path,
             "next_item": payload,
             "progress": report
         })
@@ -596,7 +614,9 @@ def colab_skip_image_handler(image_path, reason="Marked for human review", split
         print(f"[C1 CALLBACK ERROR] {str(e)}\n{err_detail}")
         return make_json_safe({
             "success": False,
+            "status": "ERROR",
             "message": str(e),
+            "image_path": image_path,
             "next_item": None,
             "error_type": type(e).__name__
         })
@@ -718,7 +738,8 @@ def launch_colab_annotation_interface(
     split: Optional[str] = "Train",
     class_name: Optional[str] = None,
     pilot: bool = False,
-    auto_resume: bool = True
+    auto_resume: bool = True,
+    debug_ui: bool = False
 ):
     """
     Renders an interactive HTML5 Canvas drawing widget directly inside Google Colab or Jupyter notebooks.
@@ -746,7 +767,7 @@ def launch_colab_annotation_interface(
     payload = prepare_image_payload(next_item)
     if not payload:
         print("Could not load image payload. Re-trying...")
-        return launch_colab_annotation_interface(split=split, class_name=class_name)
+        return launch_colab_annotation_interface(split=split, class_name=class_name, debug_ui=debug_ui)
 
     img_path = payload["image_path"]
     curr_split = payload["split"]
@@ -760,6 +781,7 @@ def launch_colab_annotation_interface(
     img_path_js = json.dumps(img_path)
     curr_split_js = json.dumps(curr_split)
     curr_class_js = json.dumps(curr_class)
+    debug_ui_js = "true" if debug_ui else "false"
 
     html_code = f"""
     <div id="annotation-widget-container" style="font-family: Arial, sans-serif; max-width: 920px; padding: 18px; border: 2px solid #1F497D; border-radius: 8px; background-color: #F8F9FA;">
@@ -810,11 +832,27 @@ def launch_colab_annotation_interface(
     </div>
 
     <script>
+        var DEBUG_UI = {debug_ui_js};
         var currentImgPath = {img_path_js};
         var currentSplit = {curr_split_js};
         var currentClass = {curr_class_js};
         var currentCode = {curr_code};
-        
+
+        function logDebug(msg, obj) {{
+            if (!DEBUG_UI) return;
+            if (obj !== undefined) {{
+                if (typeof obj === 'object' && obj !== null) {{
+                    var clone = Object.assign({{}}, obj);
+                    if (clone.base64) clone.base64 = "[base64 len=" + clone.base64.length + "]";
+                    console.log("[C1 UI] " + msg, clone);
+                }} else {{
+                    console.log("[C1 UI] " + msg, obj);
+                }}
+            }} else {{
+                console.log("[C1 UI] " + msg);
+            }}
+        }}
+
         var canvas = document.getElementById('mask-canvas');
         var ctx = canvas.getContext('2d');
         
@@ -947,6 +985,15 @@ def launch_colab_annotation_interface(
             if (typeof out === 'string') {{
                 try {{ out = JSON.parse(out); }} catch(e) {{}}
             }}
+            if (out && typeof out === 'object') {{
+                if (out.data && (out.data['application/json'] || out.data['text/plain'])) {{
+                    var sub = out.data['application/json'] || out.data['text/plain'];
+                    if (typeof sub === 'string') {{
+                        try {{ sub = JSON.parse(sub); }} catch(e) {{}}
+                    }}
+                    if (sub && typeof sub === 'object') out = sub;
+                }}
+            }}
             return out;
         }}
 
@@ -960,8 +1007,10 @@ def launch_colab_annotation_interface(
         }}
 
         function loadNextImageInPlace(item) {{
-            if (!item) {{
-                document.getElementById('annotation-widget-container').innerHTML = "<h3 style='color:#28A745;'>🎉 ALL ELIGIBLE TRAIN/VALIDATION IMAGES ARE ANNOTATED! 🎉</h3>";
+            logDebug("loadNextImageInPlace called with item:", item);
+            if (!item || typeof item !== "object") {{
+                console.error("[C1 UI] INVALID next_item:", item);
+                document.getElementById('annotation-widget-container').innerHTML = "<h3 style='color:#28A745; text-align:center; padding:30px;'>🎉 ALL ELIGIBLE TRAIN/VALIDATION IMAGES ARE ANNOTATED! 🎉</h3>";
                 return;
             }}
             currentImgPath = item.image_path;
@@ -969,12 +1018,19 @@ def launch_colab_annotation_interface(
             currentClass = item.class_name;
             currentCode = item.class_code;
 
-            document.getElementById('lbl-split').innerText = currentSplit;
-            document.getElementById('lbl-class').innerText = currentClass + ' (Code ' + currentCode + ')';
-            document.getElementById('lbl-dims').innerText = item.width + ' x ' + item.height + ' px';
-            document.getElementById('lbl-file').innerText = item.image_name;
+            if (document.getElementById('lbl-split')) document.getElementById('lbl-split').innerText = currentSplit;
+            if (document.getElementById('lbl-class')) document.getElementById('lbl-class').innerText = currentClass + ' (Code ' + currentCode + ')';
+            if (document.getElementById('lbl-dims')) document.getElementById('lbl-dims').innerText = item.width + ' x ' + item.height + ' px';
+            if (document.getElementById('lbl-file')) document.getElementById('lbl-file').innerText = item.image_name;
 
-            document.getElementById('bg-img').src = "data:image/jpeg;base64," + item.base64;
+            var bgImg = document.getElementById('bg-img');
+            if (bgImg && item.base64) {{
+                if (item.base64.indexOf('data:image') === 0) {{
+                    bgImg.src = item.base64;
+                }} else {{
+                    bgImg.src = "data:image/jpeg;base64," + item.base64;
+                }}
+            }}
             
             canvas.width = item.width;
             canvas.height = item.height;
@@ -983,38 +1039,50 @@ def launch_colab_annotation_interface(
             
             undoStack = [];
             redoStack = [];
-            clearCanvas();
+            maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            saveState();
             
             document.getElementById('btn-save').disabled = false;
             document.getElementById('btn-skip').disabled = false;
             document.getElementById('status-msg').style.color = "#1F497D";
             document.getElementById('status-msg').innerText = "Ready: Paint visible affected lesion and click Save Mask & Next.";
+            logDebug("UI ADVANCED TO: " + item.image_name + " (" + currentSplit + " / " + currentClass + ")");
         }}
 
         function skipImage() {{
+            logDebug("SKIP CLICKED for image: " + currentImgPath);
             document.getElementById('status-msg').style.color = "#FFC107";
             document.getElementById('status-msg').innerText = "⏳ Marking image skipped for review...";
             document.getElementById('btn-skip').disabled = true;
             
             if (window.google && google.colab && google.colab.kernel) {{
+                logDebug("Invoking notebook.skip_image...");
                 google.colab.kernel.invokeFunction('notebook.skip_image', [currentImgPath, "Manual review skipped", currentSplit, currentClass], {{}})
                     .then(function(res) {{
+                        logDebug("RAW SKIP RESPONSE RECEIVED:", res);
                         var data = parseColabResponse(res);
+                        logDebug("DECODED SKIP RESPONSE:", data);
+                        if (data) logDebug("response.success: " + data.success + ", response.next_item:", data.next_item);
                         if (data && data.success) {{
                             updateProgressUI(data.progress);
                             document.getElementById('status-msg').style.color = "#28A745";
                             document.getElementById('status-msg').innerText = "✅ Image marked skipped. Loading next image...";
+                            logDebug("Calling loadNextImageInPlace");
                             loadNextImageInPlace(data.next_item);
+                            logDebug("SKIP COMPLETE");
                         }} else {{
                             document.getElementById('btn-skip').disabled = false;
                             var err = (data && data.message) ? data.message : "Skip failed";
                             document.getElementById('status-msg').style.color = "#DC3545";
                             document.getElementById('status-msg').innerText = "❌ Skip Failed: " + err;
+                            logDebug("SKIP FAILED:", err);
                         }}
                     }}).catch(function(err) {{
                         document.getElementById('btn-skip').disabled = false;
                         document.getElementById('status-msg').style.color = "#DC3545";
                         document.getElementById('status-msg').innerText = "❌ Callback Error: " + err;
+                        logDebug("SKIP CALLBACK ERROR:", err);
                     }});
             }} else {{
                 document.getElementById('status-msg').innerText = "Local Jupyter execution detected.";
@@ -1022,33 +1090,40 @@ def launch_colab_annotation_interface(
         }}
 
         function saveAndNext() {{
+            logDebug("SAVE CLICKED for image: " + currentImgPath);
             document.getElementById('status-msg').style.color = "#17A2B8";
             document.getElementById('status-msg').innerText = "⏳ Validating & saving single-channel uint8 mask...";
             document.getElementById('btn-save').disabled = true;
 
             var rawMaskB64 = getRawMaskBase64();
+            logDebug("Invoking notebook.save_mask...");
 
             if (window.google && google.colab && google.colab.kernel) {{
                 google.colab.kernel.invokeFunction('notebook.save_mask', [currentImgPath, rawMaskB64, currentSplit, currentClass], {{}})
                     .then(function(res) {{
+                        logDebug("RAW SAVE RESPONSE RECEIVED:", res);
                         var data = parseColabResponse(res);
+                        logDebug("DECODED SAVE RESPONSE:", data);
+                        if (data) logDebug("response.success: " + data.success + ", response.next_item:", data.next_item);
                         if (data && data.success) {{
                             updateProgressUI(data.progress);
                             document.getElementById('status-msg').style.color = "#28A745";
                             document.getElementById('status-msg').innerText = "✅ Mask validated & saved! Loading next image...";
-                            setTimeout(function() {{
-                                loadNextImageInPlace(data.next_item);
-                            }}, 300);
+                            logDebug("Calling loadNextImageInPlace");
+                            loadNextImageInPlace(data.next_item);
+                            logDebug("SAVE COMPLETE");
                         }} else {{
                             document.getElementById('btn-save').disabled = false;
                             document.getElementById('status-msg').style.color = "#DC3545";
                             var err = (data && data.message) ? data.message : "Validation failed or empty mask";
                             document.getElementById('status-msg').innerText = "❌ " + err;
+                            logDebug("SAVE FAILED:", err);
                         }}
                     }}).catch(function(err) {{
                         document.getElementById('btn-save').disabled = false;
                         document.getElementById('status-msg').style.color = "#DC3545";
                         document.getElementById('status-msg').innerText = "❌ Callback Error: " + err;
+                        logDebug("SAVE CALLBACK ERROR:", err);
                     }});
             }} else {{
                 document.getElementById('status-msg').innerText = "Local Jupyter execution detected.";
