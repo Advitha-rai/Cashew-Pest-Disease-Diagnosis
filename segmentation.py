@@ -26,6 +26,10 @@ from src.segmentation import (
     build_segmentation_annotation_manifest,
     validate_all_manifest_masks
 )
+from src.segmentation_tool import (
+    launch_colab_annotation_interface,
+    get_annotation_progress_report
+)
 
 def main():
     parser = argparse.ArgumentParser(description="Cashew Pest and Disease Segmentation Annotation CLI")
@@ -34,6 +38,10 @@ def main():
     parser.add_argument("--manifest", action="store_true", help="Build/refresh 5,734-image segmentation annotation manifest")
     parser.add_argument("--validate", action="store_true", help="Run strict quality-control validation on all created manual masks")
     parser.add_argument("--summary", action="store_true", help="Display annotation status summary (Assigned, Annotated, Pending, Validated)")
+    parser.add_argument("--annotate", action="store_true", help="Launch interactive Colab/Jupyter manual annotation interface")
+    parser.add_argument("--progress", action="store_true", help="Display detailed annotation progress report across eligible Train/Val pool")
+    parser.add_argument("--split", type=str, default=None, choices=["Train", "Validation"], help="Filter annotation pool by split (Test split is strictly excluded)")
+    parser.add_argument("--class", type=str, dest="class_name", default=None, choices=["Aphids", "Leaf miner", "TMB", "Leaf blight"], help="Filter annotation pool by target class")
 
     args = parser.parse_args()
 
@@ -75,22 +83,33 @@ def main():
         print(f"Pending Annotations        : {pending}\n")
         return
 
-    # 4. Summary Option
-    if args.summary:
-        print("[CLI] Displaying Segmentation Annotation Summary Status...")
-        res = audit_segmentation_dataset()
-        print("\n--- SEGMENTATION ANNOTATION SUMMARY ---")
-        print(f"Audit Decision             : {res['audit_status']}")
-        print(f"Assigned Images            : {res['number_of_source_images']} (Train=4013, Val=860, Test=861)")
-        print(f"Annotated Masks            : {res['number_of_masks']}")
-        print(f"Pending Annotations        : {res['number_of_missing_masks']}")
-        print(f"Valid Image-Mask Pairs     : {res['number_of_valid_image_mask_pairs']}\n")
+    # 4. Progress Option
+    if args.progress or args.summary:
+        print("[CLI] Displaying Segmentation Annotation Summary Progress...")
+        rep = get_annotation_progress_report()
+        print("\n--- SEGMENTATION ANNOTATION PROGRESS REPORT ---")
+        print(f"Test Isolation Status      : {rep['test_set_isolation_status']}")
+        print(f"Total Eligible Images      : {rep['total_eligible_images']} (Train=4013, Val=860)")
+        print(f"Isolated Test Images       : {rep['test_images_isolated']} (Read-Only)")
+        print(f"Annotated Masks            : {rep['annotated_count']}")
+        print(f"Passed Validation          : {rep['passed_validation_count']}")
+        print(f"Pending Annotations        : {rep['pending_count']}")
+        print(f"Progress Percentage        : {rep['progress_percentage']}%\n")
         return
 
-    # Default action: Run audit and manifest build setup
-    print("[CLI] Executing default segmentation annotation preparation setup...")
-    res = audit_segmentation_dataset()
-    print("\nAnnotation preparation setup complete. Use python segmentation.py --audit, --manifest, or --validate.")
+    # 5. Annotate Option
+    if args.annotate:
+        print(f"[CLI] Launching Interactive Colab Annotation Tool (Split={args.split}, Class={args.class_name})...")
+        launch_colab_annotation_interface(split=args.split, class_name=args.class_name)
+        return
+
+    # Default action: Run dry-run annotation tool setup
+    print("[CLI] Executing default segmentation annotation tool setup...")
+    rep = get_annotation_progress_report()
+    print(f"\nEligible Train/Val Images : {rep['total_eligible_images']}")
+    print(f"Pending Annotations       : {rep['pending_count']}")
+    print(f"To launch annotation tool, use: python segmentation.py --annotate\n")
 
 if __name__ == "__main__":
     main()
+
