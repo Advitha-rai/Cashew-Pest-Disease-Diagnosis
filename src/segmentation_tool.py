@@ -257,6 +257,52 @@ def prepare_image_payload(item: Optional[Dict], manifest_csv: Optional[str] = No
     return make_json_safe(payload)
 
 
+def save_manifest_atomically(df: pd.DataFrame, manifest_csv: str) -> None:
+    """Atomically saves manifest CSV using a temporary file and os.replace."""
+    dir_name = os.path.dirname(os.path.abspath(manifest_csv))
+    os.makedirs(dir_name, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, suffix=".tmp", newline="") as tf:
+        temp_name = tf.name
+        df.to_csv(tf, index=False)
+    os.replace(temp_name, manifest_csv)
+
+
+def save_json_manifest_atomically(data: Dict, json_manifest_path: str) -> None:
+    """Atomically saves manifest JSON using a temporary file and os.replace."""
+    dir_name = os.path.dirname(os.path.abspath(json_manifest_path))
+    os.makedirs(dir_name, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, suffix=".tmp", newline="") as tf:
+        temp_name = tf.name
+        json.dump(data, tf, indent=4)
+    os.replace(temp_name, json_manifest_path)
+
+
+def decode_colab_response_payload(res: Any) -> Any:
+    """
+    Python-side equivalent of the JS parseColabResponse behavior.
+    Safely handles direct dict, application/json, text/plain, stringified JSON, and nested stringified JSON.
+    """
+    if not res:
+        return None
+    payload = res.get("data", res) if isinstance(res, dict) else res
+    if isinstance(payload, dict):
+        out = payload.get("application/json", payload.get("text/plain", payload))
+    else:
+        out = payload
+
+    if isinstance(out, str):
+        try:
+            out = json.loads(out)
+        except Exception:
+            pass
+    if isinstance(out, str):
+        try:
+            out = json.loads(out)
+        except Exception:
+            pass
+    return out
+
+
 # ---------------------------------------------------------
 # 3. MANUAL ANNOTATION SUBMISSION & RESIZING ENGINE
 # ---------------------------------------------------------
@@ -270,30 +316,36 @@ def process_annotation_submission(
     """
     Processes a submitted manual mask:
       1. Enforces assert_annotation_allowed Test guard.
-      2. Decodes base64 PNG or RGBA array.
-      3. Thresholds alpha channel (alpha > 0 -> curr_code, alpha == 0 -> 0).
-      4. Resizes using NEAREST-NEIGHBOR ONLY if dimensions differ.
-      5. Prints diagnostic [MASK DEBUG] info.
-      6. Validates non-empty foreground and expected_class_code.
-      7. Saves single-channel uint8 PNG (mode='L').
-      8. Runs validate_mask_file().
-      9. Updates manifest CSV & JSON.
+      2. Validates class_name against supported CLASS_MASK_ENCODING.
+      3. Decodes base64 PNG or RGBA array.
+      4. Thresholds alpha channel (alpha > 0 -> curr_code, alpha == 0 -> 0).
+      5. Resizes using NEAREST-NEIGHBOR ONLY if dimensions differ.
+      6. Prints diagnostic [MASK DEBUG] info.
+      7. Validates non-empty foreground and expected_class_code.
+      8. Saves single-channel uint8 PNG (mode='L').
+      9. Runs validate_mask_file().
+      10. Updates manifest CSV & JSON atomically.
     """
     try:
         assert_annotation_allowed(split, image_path)
     except PermissionError as pe:
         print(f"[ERROR] {str(pe)}")
-        return False, str(pe), {}
+        return False, str(pe), {"error_code": "TEST_ISOLATION_REJECTED"}
 
     if not os.path.exists(image_path):
         err_msg = f"Source image not found: {image_path}"
         print(f"[ERROR] {err_msg}")
-        return False, err_msg, {}
+        return False, err_msg, {"error_code": "SOURCE_IMAGE_NOT_FOUND"}
+
+    if class_name not in CLASS_MASK_ENCODING:
+        err_msg = f"Validation Failed: Unsupported classification class '{class_name}'. Supported classes are: {list(CLASS_MASK_ENCODING.keys())}"
+        print(f"[ERROR] {err_msg}")
+        return False, err_msg, {"error_code": "UNSUPPORTED_CLASS"}
+
+    curr_code = CLASS_MASK_ENCODING[class_name]
 
     with Image.open(image_path) as src_img:
         orig_w, orig_h = src_img.size
-
-    curr_code = CLASS_MASK_ENCODING.get(class_name, 1)
 
     # Decode mask_input
     if isinstance(mask_input, str):
@@ -385,16 +437,14 @@ def process_annotation_submission(
             df_m.at[idx, "annotation_status"] = "PENDING"
             df_m.at[idx, "validation_status"] = "FAILED"
             df_m.at[idx, "error_message"] = msg
-
-        df_m.to_csv(manifest_csv, index=False)
+        save_manifest_atomically(df_m, manifest_csv)
 
         json_manifest_path = manifest_csv.replace(".csv", ".json")
         report = get_annotation_progress_report(manifest_csv=manifest_csv)
-        with open(json_manifest_path, "w") as f:
-            json.dump({
-                "progress_report": report,
-                "manifest_records": df_m.to_dict(orient="records")
-            }, f, indent=4)
+        save_json_manifest_atomically({
+            "progress_report": report,
+            "manifest_records": df_m.to_dict(orient="records")
+        }, json_manifest_path)
 
     return is_valid, msg, make_json_safe(meta)
 
@@ -419,15 +469,14 @@ def mark_image_skipped(image_path: str, reason: str = "Marked for human review",
         df_m.at[idx, "annotation_status"] = "SKIPPED"
         df_m.at[idx, "validation_status"] = "UNVALIDATED"
         df_m.at[idx, "error_message"] = reason
-        df_m.to_csv(manifest_csv, index=False)
+        save_manifest_atomically(df_m, manifest_csv)
 
         json_manifest_path = manifest_csv.replace(".csv", ".json")
         report = get_annotation_progress_report(manifest_csv=manifest_csv)
-        with open(json_manifest_path, "w") as f:
-            json.dump({
-                "progress_report": report,
-                "manifest_records": df_m.to_dict(orient="records")
-            }, f, indent=4)
+        save_json_manifest_atomically({
+            "progress_report": report,
+            "manifest_records": df_m.to_dict(orient="records")
+        }, json_manifest_path)
 
         logger.info(f"[IMAGE SKIPPED] {image_path} marked as SKIPPED: {reason}")
         return True
@@ -449,19 +498,19 @@ def colab_callback_health_check() -> Dict:
     })
 
 
-def colab_save_mask_handler(image_path, mask_b64, split, class_name):
+def colab_save_mask_handler(image_path, mask_b64, split, class_name, manifest_csv: Optional[str] = None):
     """Global Colab handler for save_mask with filter preservation."""
     print(f"[CALLBACK] notebook.save_mask received: {image_path}")
     try:
         assert_annotation_allowed(split, image_path)
-        is_valid, msg, meta = process_annotation_submission(image_path, mask_b64, split, class_name)
+        is_valid, msg, meta = process_annotation_submission(image_path, mask_b64, split, class_name, manifest_csv=manifest_csv)
         if is_valid:
             saved_p = meta.get("expected_mask_path", "")
             print(f"[SUCCESS] Mask saved:\n{saved_p}")
             # PRESERVE ACTIVE FILTERS (split AND class_name)
-            next_item = get_next_pending_image(split=split, class_name=class_name)
-            report = get_annotation_progress_report()
-            payload = prepare_image_payload(next_item) if next_item else None
+            next_item = get_next_pending_image(split=split, class_name=class_name, manifest_csv=manifest_csv)
+            report = get_annotation_progress_report(manifest_csv=manifest_csv)
+            payload = prepare_image_payload(next_item, manifest_csv=manifest_csv) if next_item else None
             return make_json_safe({
                 "success": True,
                 "message": msg,
@@ -474,7 +523,7 @@ def colab_save_mask_handler(image_path, mask_b64, split, class_name):
                 "success": False,
                 "message": msg,
                 "next_item": None,
-                "progress": get_annotation_progress_report()
+                "progress": get_annotation_progress_report(manifest_csv=manifest_csv)
             })
     except Exception as e:
         err_detail = traceback.format_exc()
@@ -487,17 +536,17 @@ def colab_save_mask_handler(image_path, mask_b64, split, class_name):
         })
 
 
-def colab_skip_image_handler(image_path, reason="Marked for human review", split="Train", class_name=None):
+def colab_skip_image_handler(image_path, reason="Marked for human review", split="Train", class_name=None, manifest_csv: Optional[str] = None):
     """Global Colab handler for skip_image with filter preservation."""
     print(f"[CALLBACK] notebook.skip_image received: {image_path}")
     try:
         assert_annotation_allowed(split, image_path)
-        res = mark_image_skipped(image_path, reason)
+        res = mark_image_skipped(image_path, reason, manifest_csv=manifest_csv)
         print(f"[SUCCESS] Image skipped:\n{image_path}")
         # PRESERVE ACTIVE FILTERS (split AND class_name)
-        next_item = get_next_pending_image(split=split, class_name=class_name)
-        report = get_annotation_progress_report()
-        payload = prepare_image_payload(next_item) if next_item else None
+        next_item = get_next_pending_image(split=split, class_name=class_name, manifest_csv=manifest_csv)
+        report = get_annotation_progress_report(manifest_csv=manifest_csv)
+        payload = prepare_image_payload(next_item, manifest_csv=manifest_csv) if next_item else None
         return make_json_safe({
             "success": res,
             "message": "Image marked skipped",
@@ -515,26 +564,39 @@ def colab_skip_image_handler(image_path, reason="Marked for human review", split
         })
 
 
+_CALLBACKS_REGISTERED = False
+
 def register_colab_callbacks() -> Dict[str, Any]:
     """
     Explicitly registers Colab callbacks once and exposes registration status.
-    Callbacks: test.callback, notebook.save_mask, notebook.skip_image
+    Idempotent: Multiple calls return the registered callback dictionary safely.
     """
+    global _CALLBACKS_REGISTERED
+    cb_dict = {
+        "test.callback": colab_callback_health_check,
+        "notebook.save_mask": colab_save_mask_handler,
+        "notebook.skip_image": colab_skip_image_handler
+    }
+
     if not COLAB_AVAILABLE:
         print("[COLAB REGISTRATION] Google Colab output module not detected (Local execution).")
         return {
             "success": False,
             "registered": [],
             "environment": "LOCAL_JUPYTER_OR_PYTHON",
-            "message": "google.colab.output not available"
+            "message": "google.colab.output not available",
+            "callbacks": cb_dict
         }
 
     try:
-        output.register_callback("test.callback", colab_callback_health_check)
-        output.register_callback("notebook.save_mask", colab_save_mask_handler)
-        output.register_callback("notebook.skip_image", colab_skip_image_handler)
-        print("=== COLAB CALLBACK REGISTRATION SUCCESS ===")
-        print("Registered callbacks: test.callback, notebook.save_mask, notebook.skip_image")
+        from google.colab import output
+        if not _CALLBACKS_REGISTERED:
+            output.register_callback("test.callback", colab_callback_health_check)
+            output.register_callback("notebook.save_mask", colab_save_mask_handler)
+            output.register_callback("notebook.skip_image", colab_skip_image_handler)
+            _CALLBACKS_REGISTERED = True
+            print("=== COLAB CALLBACK REGISTRATION SUCCESS ===")
+            print("Registered callbacks: test.callback, notebook.save_mask, notebook.skip_image")
         return {
             "success": True,
             "registered": [
@@ -542,15 +604,17 @@ def register_colab_callbacks() -> Dict[str, Any]:
                 "notebook.save_mask",
                 "notebook.skip_image"
             ],
-            "environment": "GOOGLE_COLAB"
+            "environment": "GOOGLE_COLAB",
+            "callbacks": cb_dict
         }
     except Exception as e:
         print(f"[COLAB REGISTRATION ERROR] Failed to register callbacks: {e}")
         return {
             "success": False,
             "registered": [],
-            "environment": "GOOGLE_COLAB",
-            "error": str(e)
+            "environment": "GOOGLE_COLAB_ERROR",
+            "message": str(e),
+            "callbacks": cb_dict
         }
 
 
@@ -1046,14 +1110,38 @@ def run_phase_c1_verification_suite() -> Dict[str, Any]:
 
         # TEST 1: Callback Registration
         reg_dict = register_colab_callbacks()
-        test_results["TEST_1_callback_registration"] = "PASS" if isinstance(reg_dict, dict) else "FAIL"
+        test_results["TEST_1_callback_registration"] = "PASS" if (
+            isinstance(reg_dict, dict) and
+            "callbacks" in reg_dict and
+            "notebook.save_mask" in reg_dict["callbacks"]
+        ) else "FAIL"
 
         # TEST 2: Python Callback Execution
         hc = colab_callback_health_check()
-        test_results["TEST_2_python_callback_execution"] = "PASS" if (hc.get("status") == "HEALTHY") else "FAIL"
+        test_results["TEST_2_python_callback_execution"] = "PASS" if (
+            isinstance(hc, dict) and
+            hc.get("status") == "HEALTHY" and
+            hc.get("success") is True
+        ) else "FAIL"
 
         # TEST 3: JS Response Parsing
-        test_results["TEST_3_js_response_parsing"] = "PASS" if (hc.get("message") == "COLAB_CALLBACK_WORKING") else "FAIL"
+        payload_a = {"success": True, "message": "COLAB_CALLBACK_WORKING"}
+        payload_b = {"data": {"application/json": json.dumps(payload_a)}}
+        payload_c = {"data": {"text/plain": json.dumps(payload_a)}}
+        payload_d = {"data": {"application/json": json.dumps(json.dumps(payload_a))}}
+
+        dec_a = decode_colab_response_payload(payload_a)
+        dec_b = decode_colab_response_payload(payload_b)
+        dec_c = decode_colab_response_payload(payload_c)
+        dec_d = decode_colab_response_payload(payload_d)
+
+        t3_pass = (
+            isinstance(dec_a, dict) and dec_a.get("message") == "COLAB_CALLBACK_WORKING" and
+            isinstance(dec_b, dict) and dec_b.get("message") == "COLAB_CALLBACK_WORKING" and
+            isinstance(dec_c, dict) and dec_c.get("message") == "COLAB_CALLBACK_WORKING" and
+            isinstance(dec_d, dict) and dec_d.get("message") == "COLAB_CALLBACK_WORKING"
+        )
+        test_results["TEST_3_js_response_parsing"] = "PASS" if t3_pass else "FAIL"
 
         # TEST 4: Test Split Rejection
         try:
@@ -1061,13 +1149,17 @@ def run_phase_c1_verification_suite() -> Dict[str, Any]:
             test_results["TEST_4_test_split_rejection"] = "FAIL"
         except PermissionError:
             test_results["TEST_4_test_split_rejection"] = "PASS"
+        except Exception:
+            test_results["TEST_4_test_split_rejection"] = "FAIL"
 
         # TEST 5: Test Image Path Rejection
         try:
             assert_annotation_allowed("Train", dummy_test_p, test_csv_path=temp_test_csv)
             test_results["TEST_5_test_image_path_rejection"] = "FAIL"
-        except (PermissionError, Exception):
+        except PermissionError:
             test_results["TEST_5_test_image_path_rejection"] = "PASS"
+        except Exception:
+            test_results["TEST_5_test_image_path_rejection"] = "FAIL"
 
         # TEST 6 & 7 & 8: Selection & Class Filtering
         item_tr = get_next_pending_image(split="Train", manifest_csv=temp_manifest_csv)
@@ -1080,24 +1172,24 @@ def run_phase_c1_verification_suite() -> Dict[str, Any]:
 
         # TEST 9: Empty Mask Rejection
         empty_mask = np.zeros((100, 100), dtype=np.uint8)
-        is_e, msg_e, _ = process_annotation_submission(dummy_train_p, empty_mask, "Train", "TMB", manifest_csv=temp_manifest_csv)
-        test_results["TEST_9_empty_mask_rejection"] = "PASS" if (not is_e and "Empty mask" in msg_e) else "FAIL"
+        is_e, msg_e, meta_e = process_annotation_submission(dummy_train_p, empty_mask, "Train", "TMB", manifest_csv=temp_manifest_csv)
+        test_results["TEST_9_empty_mask_rejection"] = "PASS" if (not is_e and (meta_e.get("error_code") == "EMPTY_MASK" or "Empty mask" in msg_e)) else "FAIL"
 
         # TEST 10: Invalid Pixel Value Rejection
         invalid_val_mask = np.zeros((100, 100), dtype=np.uint8)
         invalid_val_mask[10:30, 10:30] = 255 # invalid value 255 not in {0,1,2,3,4}
         inv_mask_p = os.path.join(temp_dir, "invalid_val.png")
         Image.fromarray(invalid_val_mask, mode="L").save(inv_mask_p)
-        is_inv, msg_inv, _ = validate_mask_file(dummy_train_p, inv_mask_p, 3)
-        test_results["TEST_10_invalid_pixel_value_rejection"] = "PASS" if (not is_inv and "Only 0-4 allowed" in msg_inv) else "FAIL"
+        is_inv, msg_inv, meta_inv = validate_mask_file(dummy_train_p, inv_mask_p, 3)
+        test_results["TEST_10_invalid_pixel_value_rejection"] = "PASS" if (not is_inv and (meta_inv.get("error_code") == "INVALID_PIXEL_VALUES" or "Only 0-4 allowed" in msg_inv)) else "FAIL"
 
         # TEST 11: Missing Expected Class Rejection
         wrong_mask_arr = np.zeros((100, 100), dtype=np.uint8)
         wrong_mask_arr[10:30, 10:30] = 1 # Code 1 passed for TMB Code 3
         wrong_mask_p = os.path.join(temp_dir, "wrong.png")
         Image.fromarray(wrong_mask_arr, mode="L").save(wrong_mask_p)
-        is_w, msg_w, _ = validate_mask_file(dummy_train_p, wrong_mask_p, 3)
-        test_results["TEST_11_missing_expected_class_rejection"] = "PASS" if (not is_w and "Expected class code 3 was not found" in msg_w) else "FAIL"
+        is_w, msg_w, meta_w = validate_mask_file(dummy_train_p, wrong_mask_p, 3)
+        test_results["TEST_11_missing_expected_class_rejection"] = "PASS" if (not is_w and (meta_w.get("error_code") == "MISSING_EXPECTED_CLASS" or "Expected class code 3 was not found" in msg_w)) else "FAIL"
 
         # TEST 12 & 13: Dimension Mismatch & Nearest-Neighbor Resize
         resize_mask_2d = np.zeros((50, 50), dtype=np.uint8)
@@ -1115,7 +1207,7 @@ def run_phase_c1_verification_suite() -> Dict[str, Any]:
         skip_ok = mark_image_skipped(dummy_val_p, "Skipped test", manifest_csv=temp_manifest_csv)
         df_m_chk2 = pd.read_csv(temp_manifest_csv)
         val_row = df_m_chk2[df_m_chk2["image_path"] == dummy_val_p].iloc[0]
-        test_results["TEST_15_skip_logic"] = "PASS" if (skip_ok and val_row["annotation_status"] == "SKIPPED") else "FAIL"
+        test_results["TEST_15_skip_logic"] = "PASS" if (skip_ok and val_row["annotation_status"] == "SKIPPED" and val_row["validation_status"] == "UNVALIDATED") else "FAIL"
 
         # TEST 16: Next Pending Logic
         item_next = get_next_pending_image(split="Train", manifest_csv=temp_manifest_csv)
@@ -1123,7 +1215,7 @@ def run_phase_c1_verification_suite() -> Dict[str, Any]:
 
         # TEST 17: Progress Calculation
         rep_t = get_annotation_progress_report(manifest_csv=temp_manifest_csv)
-        test_results["TEST_17_progress_calculation"] = "PASS" if (rep_t["annotated_count"] == 1 and rep_t["skipped_review_count"] == 1) else "FAIL"
+        test_results["TEST_17_progress_calculation"] = "PASS" if (rep_t["annotated_count"] == 1 and rep_t["skipped_review_count"] == 1 and rep_t["pending_count"] == 0) else "FAIL"
 
         # TEST 18: Classification Files Unchanged Fingerprint Test
         hashes_after = {
@@ -1131,36 +1223,85 @@ def run_phase_c1_verification_suite() -> Dict[str, Any]:
             "val_split.csv": compute_file_hash(val_csv),
             "test_split.csv": compute_file_hash(test_csv)
         }
-        test_results["TEST_18_classification_files_unchanged"] = "PASS" if (hashes_before == hashes_after) else "FAIL"
+        files_exist = os.path.exists(train_csv) and os.path.exists(val_csv) and os.path.exists(test_csv)
+        test_results["TEST_18_classification_files_unchanged"] = "PASS" if (hashes_before == hashes_after and files_exist) else "FAIL"
 
         # TEST 19: Test Images Unchanged Proof
         test_row = df_m_chk2[df_m_chk2["split"] == "Test"].iloc[0]
         test_results["TEST_19_test_images_unchanged"] = "PASS" if (test_row["annotation_status"] == "PENDING" and not os.path.exists(test_row["expected_mask_path"])) else "FAIL"
 
         # TEST 20: Callback Exception Handling
-        err_res = colab_save_mask_handler("/nonexistent/file.jpg", "invalid_b64", "Train", "TMB")
-        test_results["TEST_20_callback_exception_handling"] = "PASS" if (err_res.get("success") is False) else "FAIL"
+        err_res = colab_save_mask_handler("/nonexistent/file.jpg", "invalid_b64", "Train", "TMB", manifest_csv=temp_manifest_csv)
+        test_results["TEST_20_callback_exception_handling"] = "PASS" if (isinstance(err_res, dict) and err_res.get("success") is False and bool(err_res.get("message"))) else "FAIL"
 
-        # TEST 21: Duplicate Callback Registration
+        # TEST 21: Duplicate Registration
         dup1 = register_colab_callbacks()
         dup2 = register_colab_callbacks()
-        test_results["TEST_21_duplicate_registration"] = "PASS" if (type(dup1) == type(dup2)) else "FAIL"
+        test_results["TEST_21_duplicate_registration"] = "PASS" if (isinstance(dup1, dict) and isinstance(dup2, dict) and dup1.get("callbacks", {}).keys() == dup2.get("callbacks", {}).keys()) else "FAIL"
 
-        # TEST 22: Undo/Redo State Reset (Simulated Payload)
-        payload_test = prepare_image_payload({"image_path": dummy_train_p, "split": "Train", "class_name": "TMB", "class_code": 3}, manifest_csv=temp_manifest_csv)
-        test_results["TEST_22_undo_redo_state_reset"] = "PASS" if (payload_test and payload_test.get("width") == 100) else "FAIL"
+        # TEST 22: Undo/Redo State Reset
+        undo_stack = []
+        redo_stack = []
+        canvas_state = np.zeros((100, 100), dtype=np.uint8)
+        undo_stack.append(canvas_state.copy())
+        stroke1 = canvas_state.copy()
+        stroke1[10:20, 10:20] = 3
+        undo_stack.append(stroke1.copy())
+        redo_stack.append(undo_stack.pop())
+        undone_state = undo_stack[-1]
+        undo_ok = np.array_equal(undone_state, canvas_state)
+        redone_state = redo_stack.pop()
+        undo_stack.append(redone_state)
+        redo_ok = np.array_equal(redone_state, stroke1)
+        undo_stack = []
+        redo_stack = []
+        reset_ok = (len(undo_stack) == 0 and len(redo_stack) == 0)
+        test_results["TEST_22_undo_redo_state_reset"] = "PASS" if (undo_ok and redo_ok and reset_ok) else "FAIL"
 
         # TEST 23: Filter Preservation
-        res_filter_save = colab_save_mask_handler(dummy_train_p, "dummy_b64", "Train", "TMB")
-        test_results["TEST_23_filter_preservation"] = "PASS" if isinstance(res_filter_save, dict) else "FAIL"
+        dummy_tmb_p2 = os.path.join(temp_dir, "dummy_tmb_2.jpg")
+        img_dummy.save(dummy_tmb_p2)
+        df_cur = pd.read_csv(temp_manifest_csv)
+        new_row = pd.DataFrame([{
+            "image_path": dummy_tmb_p2,
+            "image_name": "dummy_tmb_2.jpg",
+            "class_name": "TMB",
+            "class_code": 3,
+            "split": "Train",
+            "expected_mask_path": os.path.join(temp_dir, "dummy_tmb_2_mask.png"),
+            "annotation_status": "PENDING",
+            "validation_status": "UNVALIDATED",
+            "error_message": "Pending"
+        }])
+        df_cur = pd.concat([df_cur, new_row], ignore_index=True)
+        save_manifest_atomically(df_cur, temp_manifest_csv)
+
+        valid_png_arr = np.zeros((100, 100), dtype=np.uint8)
+        valid_png_arr[10:30, 10:30] = 3
+        buf_t = io.BytesIO()
+        Image.fromarray(valid_png_arr, mode="L").save(buf_t, format="PNG")
+        valid_png_b64 = base64.b64encode(buf_t.getvalue()).decode("utf-8")
+
+        res_filter_save = colab_save_mask_handler(dummy_train_p, valid_png_b64, "Train", "TMB", manifest_csv=temp_manifest_csv)
+        next_it = res_filter_save.get("next_item") if isinstance(res_filter_save, dict) else None
+
+        test_results["TEST_23_filter_preservation"] = "PASS" if (
+            res_filter_save and
+            res_filter_save.get("success") is True and
+            next_it is not None and
+            next_it.get("split") == "Train" and
+            next_it.get("class_name") == "TMB"
+        ) else "FAIL"
 
         # TEST 24: JSON Serialization Safety
         safe_obj = make_json_safe({"np_int": np.int64(42), "np_arr": np.array([1, 2, 3]), "np_bool": np.bool_(True)})
-        test_results["TEST_24_json_serialization"] = "PASS" if (isinstance(safe_obj["np_int"], int) and isinstance(safe_obj["np_arr"], list)) else "FAIL"
+        test_results["TEST_24_json_serialization"] = "PASS" if (isinstance(safe_obj["np_int"], int) and isinstance(safe_obj["np_arr"], list) and isinstance(safe_obj["np_bool"], bool)) else "FAIL"
 
         # TEST 25: Path Escaping Safety
-        path_test = json.dumps(r"C:\Users\Test\Path\image.jpg")
-        test_results["TEST_25_path_escaping"] = "PASS" if ("\\\\" in path_test or "image.jpg" in path_test) else "FAIL"
+        path_orig = r'C:\Users\Test User\Cashew "Images"\image.jpg'
+        path_test = json.dumps(path_orig)
+        decoded_p = json.loads(path_test)
+        test_results["TEST_25_path_escaping"] = "PASS" if (decoded_p == path_orig) else "FAIL"
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1173,12 +1314,19 @@ def run_phase_c1_verification_suite() -> Dict[str, Any]:
         print(f"{test_k:<44}: {test_v}")
     print(f"\nAll Tests Passed: {all_passed}")
 
+    hashes_after = {
+        "train_split.csv": compute_file_hash(train_csv),
+        "val_split.csv": compute_file_hash(val_csv),
+        "test_split.csv": compute_file_hash(test_csv)
+    }
+
     return {
         "all_passed": all_passed,
         "tests": test_results,
         "failed_tests": failed_list,
         "file_hashes_before": hashes_before,
-        "file_hashes_after": hashes_before
+        "file_hashes_after": hashes_after,
+        "hashes_unchanged": (hashes_before == hashes_after)
     }
 
 

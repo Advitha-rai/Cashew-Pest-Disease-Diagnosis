@@ -294,10 +294,10 @@ def validate_mask_file(image_path: str, mask_path: str, expected_class_code: int
     Returns (is_valid, status_message, metadata_dict).
     """
     if not os.path.exists(mask_path):
-        return False, "Mask file does not exist", {}
+        return False, "Mask file does not exist", {"error_code": "FILE_NOT_FOUND"}
 
     if not os.path.exists(image_path):
-        return False, f"Source image file not found: {image_path}", {}
+        return False, f"Source image file not found: {image_path}", {"error_code": "IMAGE_NOT_FOUND"}
 
     try:
         # Decode Source Image
@@ -312,32 +312,32 @@ def validate_mask_file(image_path: str, mask_path: str, expected_class_code: int
 
         # 1. Dimension match check
         if (img_w, img_h) != (mask_w, mask_h):
-            return False, f"Dimension mismatch: image ({img_w}x{img_h}) vs mask ({mask_w}x{mask_h})", {}
+            return False, f"Dimension mismatch: image ({img_w}x{img_h}) vs mask ({mask_w}x{mask_h})", {"error_code": "DIMENSION_MISMATCH"}
 
         # 2. Mode & Channel check (Must be single-channel 2D)
         if mask_arr_raw.ndim > 2 and mask_arr_raw.shape[2] > 1:
-            return False, f"Mask is multi-channel ({mask_arr_raw.shape}); single-channel uint8 PNG required", {}
+            return False, f"Mask is multi-channel ({mask_arr_raw.shape}); single-channel uint8 PNG required", {"error_code": "MULTI_CHANNEL_MASK"}
 
         # 3. Dtype check (Must be uint8 prior to processing)
         if mask_arr_raw.dtype != np.uint8:
-            return False, f"Invalid mask dtype: {mask_arr_raw.dtype}. Must be uint8", {}
+            return False, f"Invalid mask dtype: {mask_arr_raw.dtype}. Must be uint8", {"error_code": "INVALID_DTYPE"}
 
         # 4. Allowed pixel values check ({0, 1, 2, 3, 4})
         unique_vals = set(np.unique(mask_arr_raw))
         invalid_vals = unique_vals - ALLOWED_PIXEL_VALUES
         if invalid_vals:
-            return False, f"Invalid pixel values found: {sorted(list(invalid_vals))}. Only 0-4 allowed", {}
+            return False, f"Invalid pixel values found: {sorted(list(invalid_vals))}. Only 0-4 allowed", {"error_code": "INVALID_PIXEL_VALUES"}
 
         # 5. Non-empty check (at least one lesion pixel > 0)
         total_pixels = img_w * img_h
         non_zero_pixels = int(np.count_nonzero(mask_arr_raw))
         if non_zero_pixels == 0:
-            return False, "Validation Failed: Empty mask. Please paint at least one lesion region.", {}
+            return False, "Validation Failed: Empty mask. Please paint at least one lesion region.", {"error_code": "EMPTY_MASK"}
 
         # 6. Expected class code presence check
         if expected_class_code > 0 and expected_class_code not in unique_vals:
             err_code_msg = f"Validation Failed: Expected class code {expected_class_code} was not found in mask pixel values {sorted(list(unique_vals))}."
-            return False, err_code_msg, {}
+            return False, err_code_msg, {"error_code": "MISSING_EXPECTED_CLASS"}
 
         # 7. Lesion area percentage & quality control metadata
         lesion_pct = round((non_zero_pixels / total_pixels) * 100.0, 4)
