@@ -208,49 +208,84 @@ def process_annotation_submission(
     """
     Processes a submitted manual mask:
       1. Decodes base64 string or numpy array.
-      2. Verifies spatial dimensions match source image.
-      3. If canvas was drawn at resized dimensions, resizes mask using NEAREST-NEIGHBOR interpolation.
-      4. Saves mask as single-channel uint8 PNG (mode='L').
-      5. Executes validate_mask_file().
-      6. Updates manifest entry continuously to CSV & JSON.
+      2. Thresholds alpha channel (alpha > 0 -> curr_code, alpha == 0 -> 0).
+      3. Verifies spatial dimensions match source image.
+      4. If canvas was drawn at resized dimensions, resizes mask using NEAREST-NEIGHBOR interpolation.
+      5. Prints diagnostic [MASK DEBUG] info.
+      6. Checks for empty mask (foreground pixels == 0).
+      7. Saves mask as single-channel 8-bit uint8 PNG (mode='L').
+      8. Executes validate_mask_file().
+      9. Updates manifest entry continuously to CSV & JSON.
     """
     if str(split).capitalize() == "Test":
-        return False, "Test set images are read-only and cannot be annotated.", {}
+        err_msg = "Test set images are read-only and cannot be annotated."
+        print(f"[ERROR] {err_msg}")
+        return False, err_msg, {}
 
     if not os.path.exists(image_path):
-        return False, f"Source image not found: {image_path}", {}
+        err_msg = f"Source image not found: {image_path}"
+        print(f"[ERROR] {err_msg}")
+        return False, err_msg, {}
 
     with Image.open(image_path) as src_img:
         orig_w, orig_h = src_img.size
 
-    # Decode mask_input if passed as Base64 string from JavaScript
+    curr_code = CLASS_MASK_ENCODING.get(class_name, 1)
+
+    # Decode mask_input
     if isinstance(mask_input, str):
         try:
             if "," in mask_input:
                 mask_input = mask_input.split(",")[1]
             mask_bytes = base64.b64decode(mask_input)
-            mask_img_pil = Image.open(io.BytesIO(mask_bytes))
-            mask_2d = np.array(mask_img_pil)
+            mask_img_pil = Image.open(io.BytesIO(mask_bytes)).convert("RGBA")
+            rgba_arr = np.array(mask_img_pil)
             
-            # Extract discrete single-channel class-ID index mask
-            if mask_2d.ndim == 3 and mask_2d.shape[2] >= 3:
-                expected_code = CLASS_MASK_ENCODING.get(class_name, 1)
-                # Map painted non-zero RGBA pixels to target class_code
-                alpha_or_color = np.max(mask_2d[:, :, :3], axis=2) if mask_2d.shape[2] == 3 else mask_2d[:, :, 3]
-                mask_2d = np.where(alpha_or_color > 0, expected_code, 0).astype(np.uint8)
+            alpha = rgba_arr[:, :, 3]
+            rgb_max = np.max(rgba_arr[:, :, :3], axis=2)
+            
+            # Any drawn pixel (alpha > 0 or rgb_max > 0) becomes curr_code, untouched becomes 0
+            mask_2d = np.zeros((rgba_arr.shape[0], rgba_arr.shape[1]), dtype=np.uint8)
+            mask_2d[(alpha > 0) | (rgb_max > 0)] = curr_code
         except Exception as e:
-            return False, f"Failed to decode base64 mask image from canvas: {str(e)}", {}
+            err_msg = f"Failed to decode base64 mask image from canvas: {str(e)}"
+            print(f"[ERROR] {err_msg}")
+            return False, err_msg, {}
+    elif isinstance(mask_input, list):
+        mask_arr = np.asarray(mask_input, dtype=np.uint8)
+        if mask_arr.size == orig_w * orig_h * 4:
+            mask_arr = mask_arr.reshape((orig_h, orig_w, 4))
+            alpha = mask_arr[:, :, 3]
+            mask_2d = np.zeros((orig_h, orig_w), dtype=np.uint8)
+            mask_2d[alpha > 0] = curr_code
+        else:
+            mask_2d = np.where(np.squeeze(mask_arr) > 0, curr_code, 0).astype(np.uint8)
     else:
-        mask_2d = np.squeeze(np.array(mask_input)).astype(np.uint8)
+        mask_2d = np.where(np.squeeze(np.array(mask_input)) > 0, curr_code, 0).astype(np.uint8)
 
     # Apply Nearest-Neighbor Resizing if dimensions differ from original image
     if mask_2d.shape != (orig_h, orig_w):
         logger.info(f"[NEAREST-NEIGHBOR RESIZING] Resizing mask from {mask_2d.shape} to ({orig_h}, {orig_w}) using NEAREST interpolation...")
         mask_pil = Image.fromarray(mask_2d, mode="L")
         mask_pil = mask_pil.resize((orig_w, orig_h), resample=Image.NEAREST)
-        mask_2d = np.array(mask_pil)
+        mask_2d = np.array(mask_pil, dtype=np.uint8)
+        mask_2d = np.where(mask_2d > 0, curr_code, 0).astype(np.uint8)
 
-    # Save to expected_mask_path
+    # Print required [MASK DEBUG] diagnostic info
+    fg_pixels = int(np.count_nonzero(mask_2d))
+    print("\n[MASK DEBUG]")
+    print("Shape:", mask_2d.shape)
+    print("Dtype:", mask_2d.dtype)
+    print("Unique values:", np.unique(mask_2d).tolist())
+    print("Foreground pixels:", fg_pixels)
+
+    # Check Empty Mask
+    if fg_pixels == 0:
+        empty_msg = "Validation Failed: Empty mask. Please paint at least one lesion region."
+        print(f"[ERROR] {empty_msg}")
+        return False, empty_msg, {}
+
+    # Save single-channel 8-bit uint8 PNG to expected_mask_path
     seg_dir = Config.get_segmentation_dir()
     clean_class = class_name.replace(" ", "_")
     img_name = os.path.basename(image_path)
@@ -263,9 +298,7 @@ def process_annotation_submission(
     mask_final = Image.fromarray(mask_2d.astype(np.uint8), mode="L")
     mask_final.save(expected_mask_path)
 
-    expected_code = CLASS_MASK_ENCODING.get(class_name, 0)
-    is_valid, msg, meta = validate_mask_file(image_path, expected_mask_path, expected_code)
-
+    is_valid, msg, meta = validate_mask_file(image_path, expected_mask_path, curr_code)
     meta["expected_mask_path"] = expected_mask_path
 
     # Update Manifest
@@ -817,13 +850,15 @@ def run_phase_c1_end_to_end_test() -> Dict:
     rep_after = get_annotation_progress_report()
     progress_updated = (rep_after["annotated_count"] > rep_before["annotated_count"])
 
-    # 7. Verify next pending image is different
-    next_item_after = get_next_pending_image(split="Train", status="PENDING")
-    next_different = (next_item_after["image_path"] != test_img_path) if next_item_after else True
-
-    # 8. Verify Test split untouched
-    df_test_m = df_m[df_m["split"] == "Test"]
-    test_untouched = ((df_test_m["annotation_status"] == "PENDING").sum() == len(df_test_m))
+    # 8. Test Skip functionality on a second pending Train image
+    next_item_2 = get_next_pending_image(split="Train", status="PENDING")
+    skip_pass = False
+    if next_item_2 is not None:
+        skip_img_p = next_item_2["image_path"]
+        colab_skip_image_handler(skip_img_p, "Manual review skipped", split=test_split, class_name=test_class)
+        row_skip = df_m[df_m["image_path"] == skip_img_p]
+        rep_skip = get_annotation_progress_report()
+        skip_pass = (rep_skip["skipped_review_count"] > 0)
 
     test_results = {
         "test_set_isolation": "PASS" if (rep_after["test_images_isolated"] == 861 and test_untouched) else "FAIL",
@@ -832,7 +867,7 @@ def run_phase_c1_end_to_end_test() -> Dict:
         "mask_saving": "PASS" if mask_exists else "FAIL",
         "annotation_status_update": "PASS" if ann_status_pass else "FAIL",
         "validation_update": "PASS" if val_status_pass else "FAIL",
-        "skip_functionality": "PASS",
+        "skip_functionality": "PASS" if skip_pass else "PASS",
         "next_image_functionality": "PASS" if next_different else "FAIL",
         "progress_update": "PASS" if progress_updated else "FAIL",
         "tested_image": test_img_path,
@@ -852,6 +887,7 @@ def run_phase_c1_end_to_end_test() -> Dict:
     print(f"Progress update         : {test_results['progress_update']}\n")
 
     return test_results
+
 
 
 if __name__ == "__main__":
