@@ -55,7 +55,7 @@ except ImportError:
 # ---------------------------------------------------------
 # 0. CENTRALIZED TEST ISOLATION GUARD & JSON HELPER
 # ---------------------------------------------------------
-def assert_annotation_allowed(split: str, image_path: str) -> None:
+def assert_annotation_allowed(split: str, image_path: str, test_csv_path: Optional[str] = None) -> None:
     """
     Centralized guard enforcing strict Test-Set Isolation.
     Rejects any operation targeting Test split or test set files.
@@ -64,11 +64,13 @@ def assert_annotation_allowed(split: str, image_path: str) -> None:
     if clean_split == "Test":
         raise PermissionError(f"[TEST ISOLATION GUARD REJECTED] Test split images are read-only and cannot be annotated/skipped.")
 
-    preprocessed_dir = Config.get_preprocessed_dir()
-    test_csv = os.path.join(preprocessed_dir, "test_split.csv")
-    if os.path.exists(test_csv):
+    if test_csv_path is None:
+        preprocessed_dir = Config.get_preprocessed_dir()
+        test_csv_path = os.path.join(preprocessed_dir, "test_split.csv")
+
+    if os.path.exists(test_csv_path):
         try:
-            df_test = pd.read_csv(test_csv)
+            df_test = pd.read_csv(test_csv_path)
             test_paths = set(df_test["file_path"].astype(str))
             if str(image_path) in test_paths:
                 raise PermissionError(f"[TEST ISOLATION GUARD REJECTED] File {image_path} belongs to isolated Test set.")
@@ -990,6 +992,10 @@ def run_phase_c1_verification_suite() -> Dict[str, Any]:
         img_dummy.save(dummy_test_p)
 
         temp_manifest_csv = os.path.join(temp_dir, "temp_manifest.csv")
+        temp_test_csv = os.path.join(temp_dir, "test_split.csv")
+
+        df_temp_test = pd.DataFrame([{"file_path": dummy_test_p, "class_name": "Leaf miner"}])
+        df_temp_test.to_csv(temp_test_csv, index=False)
 
         df_temp = pd.DataFrame([
             {
@@ -1041,14 +1047,14 @@ def run_phase_c1_verification_suite() -> Dict[str, Any]:
 
         # TEST 4: Test Split Rejection
         try:
-            assert_annotation_allowed("Test", dummy_test_p)
+            assert_annotation_allowed("Test", dummy_test_p, test_csv_path=temp_test_csv)
             test_results["TEST_4_test_split_rejection"] = "FAIL"
         except PermissionError:
             test_results["TEST_4_test_split_rejection"] = "PASS"
 
         # TEST 5: Test Image Path Rejection
         try:
-            assert_annotation_allowed("Train", dummy_test_p)
+            assert_annotation_allowed("Train", dummy_test_p, test_csv_path=temp_test_csv)
             test_results["TEST_5_test_image_path_rejection"] = "FAIL"
         except (PermissionError, Exception):
             test_results["TEST_5_test_image_path_rejection"] = "PASS"
