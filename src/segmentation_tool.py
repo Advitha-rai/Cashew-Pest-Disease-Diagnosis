@@ -2381,7 +2381,7 @@ function updateProgressUI(rep) {{
 
             element.innerText =
                 value;
-        }
+        }}
     );
 }}
 
