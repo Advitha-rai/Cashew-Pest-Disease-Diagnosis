@@ -1,1587 +1,4023 @@
 """
-Cashew Pest and Disease Diagnosis System
-Phase C.1: Interactive Manual Segmentation Annotation Tool (Google Colab / Jupyter)
+segmentation_tool.py
 
-Features:
-  - Interactive HTML5 Canvas brush/paint drawing widget with Pointer Events support (mouse/touch)
-  - Separate visual overlay layer vs. single-channel discrete uint8 class-ID mask layer
-  - Controlled Colab callback registration via register_colab_callbacks()
-  - Safe response decoder handling application/json, text/plain, and stringified JSON payloads
-  - Centralized Test-Set Isolation Guard (assert_annotation_allowed)
-  - 5-Class Pixel Mask Encoding (0=Background, 1=Aphids, 2=Leaf miner, 3=TMB, 4=Leaf blight)
-  - Nearest-neighbor interpolation applied during mask resizing ONLY if canvas dimensions differ
-  - UI Controls: Brush size slider, Eraser toggle, Clear, Undo, Redo, Save Mask & Next, Skip for Review
-  - Real-time progress stats display (Eligible Pool=4,873, Test Isolated=861, Annotated, Passed, Skipped, Pending, %)
-  - Strict quality-control validation via validate_mask_file() (fails on empty mask or missing class code)
-  - Continuous progress persistence to segmentation_annotation_manifest.csv and .json with status preservation
-  - Truthful 25-test automated verification suite operating on isolated temporary test directories with SHA-256 file integrity verification
+Phase C.1 - Cashew Leaf Manual Segmentation Tool
+
+Purpose
+-------
+Manual segmentation of visible pest/disease lesions on Cashew leaf images.
+
+Class codes
+-----------
+0 = Background
+1 = Aphids
+2 = Leaf_Miner
+3 = TMB
+4 = Leaf_Blight
+
+Safety guarantees
+-----------------
+- Train and Validation are annotatable.
+- Test is strictly read-only.
+- Classification split CSV files are never modified.
+- Masks are single-channel uint8 PNG files.
+- Valid mask values are only {0,1,2,3,4}.
+- Expected class code must be present.
+- Dimension mismatches are resized using nearest-neighbor.
+- Manifest updates are atomic.
+- Colab callbacks return JSON-safe dictionaries.
+- Verification suite operates on temporary data.
 """
 
-import os
-import sys
+from __future__ import annotations
+
 import base64
+import hashlib
 import io
 import json
-import logging
-import hashlib
-import traceback
+import os
 import shutil
 import tempfile
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 from PIL import Image
-from typing import Dict, List, Tuple, Optional, Any
 
-from src.config import Config
-from src.utils import get_logger
-from src.segmentation import (
-    CLASS_MASK_ENCODING,
-    ALLOWED_PIXEL_VALUES,
-    validate_mask_file,
-    validate_all_manifest_masks,
-    build_segmentation_annotation_manifest
-)
 
-logger = get_logger("SegmentationAnnotationTool")
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-# Check Colab Availability
+CLASS_CODES = {
+    "Aphids": 1,
+    "Aphid": 1,
+
+    "Leaf_Miner": 2,
+    "Leaf Miner": 2,
+    "Leaf miner": 2,
+
+    "TMB": 3,
+
+    "Leaf_Blight": 4,
+    "Leaf Blight": 4,
+}
+
+VALID_MASK_VALUES = {0, 1, 2, 3, 4}
+ANNOTATABLE_SPLITS = {"Train", "Validation"}
+PROTECTED_SPLITS = {"Test"}
+
+DEFAULT_BRUSH_SIZE = 14
+MAX_UNDO_STATES = 25
+
+
+# ============================================================
+# OPTIONAL PROJECT CONFIG
+# ============================================================
+
 try:
-    from google.colab import output
-    COLAB_AVAILABLE = True
-except ImportError:
-    COLAB_AVAILABLE = False
+    from src.config import Config
+except Exception:
+    Config = None
 
 
-# ---------------------------------------------------------
-# 0. CENTRALIZED TEST ISOLATION GUARD & JSON HELPER
-# ---------------------------------------------------------
-def assert_annotation_allowed(split: str, image_path: str, test_csv_path: Optional[str] = None) -> None:
+def _find_project_root() -> Path:
     """
-    Centralized guard enforcing strict Test-Set Isolation.
-    Rejects any operation targeting Test split or test set files.
+    Attempts to locate the project root.
     """
-    clean_split = str(split).capitalize()
-    if clean_split == "Test":
-        raise PermissionError(f"[TEST ISOLATION GUARD REJECTED] Test split images are read-only and cannot be annotated/skipped.")
 
-    if test_csv_path is None:
-        preprocessed_dir = Config.get_preprocessed_dir()
-        test_csv_path = os.path.join(preprocessed_dir, "test_split.csv")
+    candidates = [
+        Path.cwd(),
+        Path("/content/Cashew-Pest-Disease-Diagnosis"),
+        Path("/content/drive/MyDrive/Cashew_Pest_Disease_Project"),
+    ]
 
-    if os.path.exists(test_csv_path):
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return Path.cwd()
+
+
+PROJECT_ROOT = _find_project_root()
+
+
+def get_preprocessed_dir() -> Path:
+    """
+    Gets preprocessing directory without requiring Config.
+    """
+
+    if Config is not None:
         try:
-            df_test = pd.read_csv(test_csv_path)
-            test_paths = set(df_test["file_path"].astype(str))
-            if str(image_path) in test_paths:
-                raise PermissionError(f"[TEST ISOLATION GUARD REJECTED] File {image_path} belongs to isolated Test set.")
-        except Exception as e:
-            if isinstance(e, PermissionError):
-                raise e
+            p = Config.get_preprocessed_dir()
+            return Path(p)
+        except Exception:
+            pass
 
+    candidates = [
+        PROJECT_ROOT / "Preprocessed",
+        PROJECT_ROOT / "preprocessed",
+        PROJECT_ROOT / "data" / "Preprocessed",
+        PROJECT_ROOT / "data" / "preprocessed",
+    ]
+
+    for p in candidates:
+        if p.exists():
+            return p
+
+    p = PROJECT_ROOT / "Preprocessed"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def get_segmentation_dir() -> Path:
+    """
+    Directory used by the segmentation tool.
+    """
+
+    p = PROJECT_ROOT / "Segmentation"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def get_manifest_path() -> Path:
+    return get_segmentation_dir() / "annotation_manifest.csv"
+
+
+def get_mask_dir() -> Path:
+    p = get_segmentation_dir() / "masks"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+# ============================================================
+# JSON SAFETY
+# ============================================================
 
 def make_json_safe(obj: Any) -> Any:
-    """Recursively converts NumPy types to native Python JSON-serializable types."""
+    """
+    Converts NumPy/Pandas/Path values into JSON-safe Python types.
+    """
+
     if isinstance(obj, dict):
-        return {k: make_json_safe(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [make_json_safe(v) for v in obj]
-    elif isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+        return {
+            str(k): make_json_safe(v)
+            for k, v in obj.items()
+        }
+
+    if isinstance(obj, (list, tuple)):
+        return [make_json_safe(x) for x in obj]
+
+    if isinstance(obj, np.integer):
         return int(obj)
-    elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
+
+    if isinstance(obj, np.floating):
         return float(obj)
-    elif isinstance(obj, (np.bool_, bool)):
+
+    if isinstance(obj, np.bool_):
         return bool(obj)
-    elif isinstance(obj, np.ndarray):
+
+    if isinstance(obj, np.ndarray):
         return obj.tolist()
+
+    if isinstance(obj, Path):
+        return str(obj)
+
+    if pd.isna(obj):
+        return None
+
     return obj
 
 
-class CanvasHistoryStateModel:
+# ============================================================
+# HASHING
+# ============================================================
+
+def compute_file_hash(file_path: str | Path) -> Optional[str]:
     """
-    Deterministic Python-side simulation of the exact JavaScript Canvas history contract used in Colab.
-    Models undoStack, redoStack, saveState(), undoStroke(), redoStroke(), clearCanvas(), loadNextImage().
+    SHA-256 hash of a file.
     """
-    def __init__(self, width: int = 100, height: int = 100, max_history: int = 25):
-        self.width = width
-        self.height = height
-        self.max_history = max_history
-        self.undo_stack: List[np.ndarray] = []
-        self.redo_stack: List[np.ndarray] = []
-        self.current_state = np.zeros((height, width), dtype=np.uint8)
-        self.save_state()
 
-    def save_state(self) -> None:
-        self.undo_stack.append(self.current_state.copy())
-        if len(self.undo_stack) > self.max_history:
-            self.undo_stack.pop(0)
-        self.redo_stack.clear()
+    path = Path(file_path)
 
-    def paint_stroke(self, y1: int, y2: int, x1: int, x2: int, code: int) -> None:
-        self.current_state[y1:y2, x1:x2] = code
-        self.save_state()
+    if not path.exists() or not path.is_file():
+        return None
 
-    def undo_stroke(self) -> bool:
-        if len(self.undo_stack) > 1:
-            popped = self.undo_stack.pop()
-            self.redo_stack.append(popped)
-            self.current_state = self.undo_stack[-1].copy()
-            return True
-        return False
+    sha = hashlib.sha256()
 
-    def redo_stroke(self) -> bool:
-        if len(self.redo_stack) > 0:
-            state = self.redo_stack.pop()
-            self.undo_stack.append(state.copy())
-            self.current_state = state.copy()
-            return True
-        return False
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            sha.update(chunk)
 
-    def clear_canvas(self) -> None:
-        self.current_state = np.zeros((self.height, self.width), dtype=np.uint8)
-        self.save_state()
-
-    def load_next_image(self, new_w: int = 100, new_h: int = 100) -> None:
-        self.width = new_w
-        self.height = new_h
-        self.undo_stack.clear()
-        self.redo_stack.clear()
-        self.current_state = np.zeros((new_h, new_w), dtype=np.uint8)
-        self.save_state()
+    return sha.hexdigest()
 
 
-def compute_file_hash(filepath: str) -> str:
-    """Computes SHA-256 hash of a file for integrity verification."""
-    if not os.path.exists(filepath):
-        return "FILE_NOT_FOUND"
-    hasher = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        while chunk := f.read(65536):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+# ============================================================
+# CLASS UTILITIES
+# ============================================================
 
-
-# ---------------------------------------------------------
-# 1. PROGRESS REPORTING ENGINE
-# ---------------------------------------------------------
-def get_annotation_progress_report(manifest_csv: Optional[str] = None) -> Dict:
+def normalize_class_name(class_name: str) -> str:
     """
-    Computes comprehensive annotation progress statistics for the eligible Train/Val pool.
-    Excludes Test images (861) from progress completion targets.
+    Normalizes known class-name variations.
     """
-    if manifest_csv is None:
-        seg_dir = Config.get_segmentation_dir()
-        manifest_csv = os.path.join(seg_dir, "segmentation_annotation_manifest.csv")
 
-    if not os.path.exists(manifest_csv):
-        df_manifest = build_segmentation_annotation_manifest()
-    else:
-        df_manifest = pd.read_csv(manifest_csv)
+    if class_name is None:
+        return ""
 
-    df_eligible = df_manifest[df_manifest["split"] != "Test"].copy()
-    df_test = df_manifest[df_manifest["split"] == "Test"].copy()
+    value = str(class_name).strip()
 
-    total_eligible = len(df_eligible)
-    annotated_cnt = int((df_eligible["annotation_status"] == "ANNOTATED").sum())
-    passed_cnt = int((df_eligible["validation_status"] == "PASSED").sum())
-    failed_cnt = int((df_eligible["validation_status"] == "FAILED").sum())
-    skipped_cnt = int((df_eligible["annotation_status"] == "SKIPPED").sum())
-    pending_cnt = total_eligible - annotated_cnt - skipped_cnt
-    pct_complete = round((annotated_cnt / total_eligible * 100.0) if total_eligible > 0 else 0.0, 2)
-
-    per_class = {}
-    for c_name in ["Aphids", "Leaf miner", "TMB", "Leaf blight"]:
-        df_c = df_eligible[df_eligible["class_name"] == c_name]
-        tot_c = len(df_c)
-        ann_c = int((df_c["annotation_status"] == "ANNOTATED").sum())
-        pass_c = int((df_c["validation_status"] == "PASSED").sum())
-        per_class[c_name] = {
-            "total_assigned": tot_c,
-            "annotated": ann_c,
-            "passed_validation": pass_c,
-            "pending": tot_c - ann_c,
-            "percentage_complete": round((ann_c / tot_c * 100.0) if tot_c > 0 else 0.0, 2)
-        }
-
-    per_split = {}
-    for s_name in ["Train", "Validation"]:
-        df_s = df_eligible[df_eligible["split"] == s_name]
-        tot_s = len(df_s)
-        ann_s = int((df_s["annotation_status"] == "ANNOTATED").sum())
-        pass_s = int((df_s["validation_status"] == "PASSED").sum())
-        per_split[s_name] = {
-            "total_assigned": tot_s,
-            "annotated": ann_s,
-            "passed_validation": pass_s,
-            "pending": tot_s - ann_s,
-            "percentage_complete": round((ann_s / tot_s * 100.0) if tot_s > 0 else 0.0, 2)
-        }
-
-    report = {
-        "phase": "Phase C.1 — Interactive Manual Segmentation Annotation Tool",
-        "test_set_isolation_status": f"VERIFIED_ISOLATED ({len(df_test)} Test images excluded from annotation pool)",
-        "total_eligible_images": total_eligible,
-        "test_images_isolated": len(df_test),
-        "annotated_count": annotated_cnt,
-        "passed_validation_count": passed_cnt,
-        "failed_validation_count": failed_cnt,
-        "skipped_review_count": skipped_cnt,
-        "pending_count": pending_cnt,
-        "progress_percentage": pct_complete,
-        "per_class_breakdown": per_class,
-        "per_split_breakdown": per_split
+    aliases = {
+        "Aphid": "Aphids",
+        "Leaf Miner": "Leaf_Miner",
+        "Leaf miner": "Leaf_Miner",
+        "Leaf Blight": "Leaf_Blight",
     }
 
-    return make_json_safe(report)
+    return aliases.get(value, value)
 
 
-# ---------------------------------------------------------
-# 2. NEXT PENDING IMAGE SELECTOR & PAYLOAD HELPER
-# ---------------------------------------------------------
+def get_class_code(class_name: str) -> int:
+    normalized = normalize_class_name(class_name)
+
+    if normalized not in CLASS_CODES:
+        raise ValueError(
+            f"Unknown class '{class_name}'. "
+            f"Expected one of: {sorted(set(CLASS_CODES.keys()))}"
+        )
+
+    return CLASS_CODES[normalized]
+
+
+# ============================================================
+# ATOMIC CSV WRITING
+# ============================================================
+
+def save_manifest_atomically(
+    df: pd.DataFrame,
+    manifest_csv: str | Path,
+) -> None:
+    """
+    Writes manifest atomically.
+
+    The existing manifest is replaced only after the temporary
+    file has been successfully written.
+    """
+
+    manifest_csv = Path(manifest_csv)
+    manifest_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    fd, temp_name = tempfile.mkstemp(
+        prefix=".manifest_",
+        suffix=".tmp",
+        dir=str(manifest_csv.parent),
+    )
+
+    os.close(fd)
+
+    try:
+        df.to_csv(temp_name, index=False)
+
+        # Validate that the temporary file can be read.
+        pd.read_csv(temp_name)
+
+        os.replace(temp_name, manifest_csv)
+
+    finally:
+        if os.path.exists(temp_name):
+            os.remove(temp_name)
+
+
+# ============================================================
+# MANIFEST CREATION
+# ============================================================
+
+MANIFEST_COLUMNS = [
+    "image_path",
+    "image_name",
+    "class_name",
+    "class_code",
+    "split",
+    "expected_mask_path",
+    "annotation_status",
+    "validation_status",
+    "error_message",
+]
+
+
+def create_manifest_from_split_files(
+    train_csv: str | Path,
+    val_csv: str | Path,
+    test_csv: str | Path,
+    output_csv: str | Path,
+) -> pd.DataFrame:
+    """
+    Creates a segmentation manifest from classification split CSVs.
+
+    The source split CSVs are READ ONLY.
+    """
+
+    train_csv = Path(train_csv)
+    val_csv = Path(val_csv)
+    test_csv = Path(test_csv)
+    output_csv = Path(output_csv)
+
+    rows = []
+
+    def add_split(csv_path: Path, split_name: str) -> None:
+
+        if not csv_path.exists():
+            raise FileNotFoundError(csv_path)
+
+        df = pd.read_csv(csv_path)
+
+        path_col = None
+
+        for candidate in [
+            "image_path",
+            "file_path",
+            "filepath",
+            "path",
+        ]:
+            if candidate in df.columns:
+                path_col = candidate
+                break
+
+        if path_col is None:
+            raise ValueError(
+                f"No image path column found in {csv_path}"
+            )
+
+        class_col = None
+
+        for candidate in [
+            "class_name",
+            "class",
+            "label",
+            "class_label",
+        ]:
+            if candidate in df.columns:
+                class_col = candidate
+                break
+
+        if class_col is None:
+            raise ValueError(
+                f"No class column found in {csv_path}"
+            )
+
+        for _, row in df.iterrows():
+
+            image_path = str(row[path_col])
+            class_name = normalize_class_name(row[class_col])
+            class_code = get_class_code(class_name)
+
+            image_name = os.path.basename(image_path)
+
+            expected_mask_path = (
+                get_mask_dir()
+                / split_name
+                / class_name
+                / f"{Path(image_name).stem}_mask.png"
+            )
+
+            rows.append({
+                "image_path": image_path,
+                "image_name": image_name,
+                "class_name": class_name,
+                "class_code": class_code,
+                "split": split_name,
+                "expected_mask_path": str(expected_mask_path),
+                "annotation_status": "PENDING",
+                "validation_status": "UNVALIDATED",
+                "error_message": "Pending",
+            })
+
+    add_split(train_csv, "Train")
+    add_split(val_csv, "Validation")
+    add_split(test_csv, "Test")
+
+    manifest = pd.DataFrame(rows, columns=MANIFEST_COLUMNS)
+
+    save_manifest_atomically(manifest, output_csv)
+
+    return manifest
+
+
+# ============================================================
+# MANIFEST LOADING
+# ============================================================
+
+def load_manifest(
+    manifest_csv: str | Path | None = None,
+) -> pd.DataFrame:
+
+    path = Path(manifest_csv or get_manifest_path())
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Annotation manifest not found: {path}"
+        )
+
+    df = pd.read_csv(path)
+
+    for col in MANIFEST_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    return df
+
+
+# ============================================================
+# TEST SPLIT PROTECTION
+# ============================================================
+
+def _get_test_paths(
+    test_csv_path: str | Path,
+) -> set[str]:
+
+    path = Path(test_csv_path)
+
+    if not path.exists():
+        return set()
+
+    df = pd.read_csv(path)
+
+    path_col = None
+
+    for candidate in [
+        "image_path",
+        "file_path",
+        "filepath",
+        "path",
+    ]:
+        if candidate in df.columns:
+            path_col = candidate
+            break
+
+    if path_col is None:
+        return set()
+
+    return {
+        os.path.normcase(os.path.abspath(str(x)))
+        for x in df[path_col].dropna()
+    }
+
+
+def assert_annotation_allowed(
+    split: str,
+    image_path: str | Path,
+    test_csv_path: str | Path | None = None,
+) -> None:
+    """
+    Strictly prevents Test images from annotation.
+    """
+
+    split = str(split).strip()
+
+    if split in PROTECTED_SPLITS:
+        raise PermissionError(
+            "Test split is read-only. Annotation is prohibited."
+        )
+
+    if split not in ANNOTATABLE_SPLITS:
+        raise PermissionError(
+            f"Annotation is not allowed for split '{split}'."
+        )
+
+    if test_csv_path is not None:
+
+        test_paths = _get_test_paths(test_csv_path)
+
+        normalized = os.path.normcase(
+            os.path.abspath(str(image_path))
+        )
+
+        if normalized in test_paths:
+            raise PermissionError(
+                "Image belongs to isolated Test set. "
+                "Annotation is prohibited."
+            )
+
+
+# ============================================================
+# IMAGE INFORMATION
+# ============================================================
+
+def get_image_dimensions(
+    image_path: str | Path,
+) -> Tuple[int, int]:
+
+    with Image.open(image_path) as img:
+        return img.width, img.height
+
+
+def image_to_base64(
+    image_path: str | Path,
+) -> str:
+
+    with open(image_path, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode("utf-8")
+
+    return encoded
+
+
+# ============================================================
+# NEXT IMAGE
+# ============================================================
+
 def get_next_pending_image(
-    split: Optional[str] = None,
-    class_name: Optional[str] = None,
-    status: str = "PENDING",
-    manifest_csv: Optional[str] = None
-) -> Optional[Dict]:
-    """
-    Finds the next eligible image from Train or Validation split matching specified filters.
-    Enforces assert_annotation_allowed guard.
-    """
-    if split is not None and str(split).capitalize() == "Test":
-        assert_annotation_allowed("Test", "")
+    split: str | None = None,
+    class_name: str | None = None,
+    manifest_csv: str | Path | None = None,
+) -> Optional[Dict[str, Any]]:
 
-    if manifest_csv is None:
-        seg_dir = Config.get_segmentation_dir()
-        manifest_csv = os.path.join(seg_dir, "segmentation_annotation_manifest.csv")
+    df = load_manifest(manifest_csv)
 
-    if not os.path.exists(manifest_csv):
-        df = build_segmentation_annotation_manifest()
-    else:
-        df = pd.read_csv(manifest_csv)
-
-    df_filtered = df[df["split"] != "Test"].copy()
+    working = df.copy()
 
     if split is not None:
-        df_filtered = df_filtered[df_filtered["split"] == str(split).capitalize()]
+        working = working[
+            working["split"].astype(str) == str(split)
+        ]
 
     if class_name is not None:
-        df_filtered = df_filtered[df_filtered["class_name"] == str(class_name)]
+        normalized = normalize_class_name(class_name)
 
-    if status is not None:
-        df_filtered = df_filtered[df_filtered["annotation_status"] == str(status).upper()]
+        working = working[
+            working["class_name"].apply(
+                normalize_class_name
+            ) == normalized
+        ]
 
-    if df_filtered.empty:
-        logger.info(f"No pending images found for filter: Split={split}, Class={class_name}, Status={status}")
+    working = working[
+        working["annotation_status"].astype(str) == "PENDING"
+    ]
+
+    working = working[
+        working["split"].isin(ANNOTATABLE_SPLITS)
+    ]
+
+    if working.empty:
         return None
 
-    first_row = df_filtered.iloc[0].to_dict()
-    assert_annotation_allowed(first_row["split"], first_row["image_path"])
-    return make_json_safe(first_row)
+    row = working.iloc[0]
 
+    image_path = Path(str(row["image_path"]))
 
-def prepare_image_payload(item: Optional[Dict], manifest_csv: Optional[str] = None) -> Optional[Dict]:
-    """Prepares JSON-serializable image payload for HTML/JS rendering."""
-    if not item:
-        return None
+    if not image_path.exists():
+        return {
+            "image_path": str(image_path),
+            "image_name": image_path.name,
+            "class_name": normalize_class_name(
+                row["class_name"]
+            ),
+            "class_code": int(row["class_code"]),
+            "split": row["split"],
+            "width": 0,
+            "height": 0,
+            "base64": None,
+            "error": "Image file does not exist.",
+        }
 
-    img_path = item["image_path"]
-    if not os.path.exists(img_path):
-        mark_image_skipped(img_path, "Source file not found", manifest_csv=manifest_csv)
-        next_item = get_next_pending_image(split=item.get("split"), class_name=item.get("class_name"), manifest_csv=manifest_csv)
-        return prepare_image_payload(next_item, manifest_csv=manifest_csv)
+    width, height = get_image_dimensions(image_path)
 
-    with Image.open(img_path) as img:
-        w, h = img.size
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG")
-        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-    payload = {
-        "image_path": img_path,
-        "image_name": os.path.basename(img_path),
-        "split": item["split"],
-        "class_name": item["class_name"],
-        "class_code": int(item["class_code"]),
-        "width": w,
-        "height": h,
-        "base64": img_b64
-    }
-
-    return make_json_safe(payload)
-
-
-def save_manifest_atomically(df: pd.DataFrame, manifest_csv: str) -> None:
-    """Atomically saves manifest CSV using a temporary file and os.replace."""
-    dir_name = os.path.dirname(os.path.abspath(manifest_csv))
-    os.makedirs(dir_name, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, suffix=".tmp", newline="") as tf:
-        temp_name = tf.name
-        df.to_csv(tf, index=False)
-    os.replace(temp_name, manifest_csv)
-
-
-def save_json_manifest_atomically(data: Dict, json_manifest_path: str) -> None:
-    """Atomically saves manifest JSON using a temporary file and os.replace."""
-    dir_name = os.path.dirname(os.path.abspath(json_manifest_path))
-    os.makedirs(dir_name, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, suffix=".tmp", newline="") as tf:
-        temp_name = tf.name
-        json.dump(data, tf, indent=4)
-    os.replace(temp_name, json_manifest_path)
-
-
-def find_manifest_match_index(df_m: pd.DataFrame, image_path: str, split: Optional[str] = None) -> pd.Index:
-    """Robustly matches image_path in manifest by exact path, normalized path, endswith match, or image_name + split."""
-    if df_m.empty or "image_path" not in df_m.columns:
-        return pd.Index([])
-
-    norm_target = os.path.normpath(image_path).replace("\\", "/").lower()
-    target_base = os.path.basename(image_path).lower()
-
-    # 1. Exact match
-    exact_matches = df_m[df_m["image_path"] == image_path].index
-    if not exact_matches.empty:
-        return exact_matches
-
-    # 2. Normalized path match
-    norm_paths = df_m["image_path"].astype(str).apply(lambda p: os.path.normpath(p).replace("\\", "/").lower())
-    norm_matches = df_m[norm_paths == norm_target].index
-    if not norm_matches.empty:
-        return norm_matches
-
-    # 3. Path suffix match (relative vs absolute path)
-    suffix_matches = df_m[norm_paths.apply(lambda p: norm_target.endswith(p) or p.endswith(norm_target))].index
-    if not suffix_matches.empty:
-        return suffix_matches
-
-    # 4. Image name + split match
-    if split is not None and "image_name" in df_m.columns and "split" in df_m.columns:
-        clean_split = str(split).capitalize()
-        name_split_matches = df_m[(df_m["image_name"].astype(str).str.lower() == target_base) & (df_m["split"] == clean_split)].index
-        if not name_split_matches.empty:
-            return name_split_matches
-
-    # 5. Image name match fallback
-    if "image_name" in df_m.columns:
-        return df_m[df_m["image_name"].astype(str).str.lower() == target_base].index
-
-    return pd.Index([])
-
-
-def decode_colab_response_payload(res: Any) -> Any:
-    """
-    Python-side equivalent of the JS parseColabResponse behavior.
-    Safely handles direct dict, application/json, text/plain, stringified JSON, and nested stringified JSON.
-    """
-    if not res:
-        return None
-    payload = res.get("data", res) if isinstance(res, dict) else res
-    if isinstance(payload, dict):
-        out = payload.get("application/json", payload.get("text/plain", payload))
-    else:
-        out = payload
-
-    if isinstance(out, str):
-        try:
-            out = json.loads(out)
-        except Exception:
-            pass
-    if isinstance(out, str):
-        try:
-            out = json.loads(out)
-        except Exception:
-            pass
-    return out
-
-
-# ---------------------------------------------------------
-# 3. MANUAL ANNOTATION SUBMISSION & RESIZING ENGINE
-# ---------------------------------------------------------
-def process_annotation_submission(
-    image_path: str,
-    mask_input: any,
-    split: str,
-    class_name: str,
-    manifest_csv: Optional[str] = None
-) -> Tuple[bool, str, Dict]:
-    """
-    Processes a submitted manual mask:
-      1. Enforces assert_annotation_allowed Test guard.
-      2. Validates class_name against supported CLASS_MASK_ENCODING.
-      3. Decodes base64 PNG or RGBA array.
-      4. Thresholds alpha channel (alpha > 0 -> curr_code, alpha == 0 -> 0).
-      5. Resizes using NEAREST-NEIGHBOR ONLY if dimensions differ.
-      6. Prints diagnostic [MASK DEBUG] info.
-      7. Validates non-empty foreground and expected_class_code.
-      8. Saves single-channel uint8 PNG (mode='L').
-      9. Runs validate_mask_file().
-      10. Updates manifest CSV & JSON atomically.
-    """
-    try:
-        assert_annotation_allowed(split, image_path)
-    except PermissionError as pe:
-        print(f"[ERROR] {str(pe)}")
-        return False, str(pe), {"error_code": "TEST_ISOLATION_REJECTED"}
-
-    if not os.path.exists(image_path):
-        err_msg = f"Source image not found: {image_path}"
-        print(f"[ERROR] {err_msg}")
-        return False, err_msg, {"error_code": "SOURCE_IMAGE_NOT_FOUND"}
-
-    if class_name not in CLASS_MASK_ENCODING:
-        err_msg = f"Validation Failed: Unsupported classification class '{class_name}'. Supported classes are: {list(CLASS_MASK_ENCODING.keys())}"
-        print(f"[ERROR] {err_msg}")
-        return False, err_msg, {"error_code": "UNSUPPORTED_CLASS"}
-
-    curr_code = CLASS_MASK_ENCODING[class_name]
-
-    with Image.open(image_path) as src_img:
-        orig_w, orig_h = src_img.size
-
-    # Decode mask_input
-    if isinstance(mask_input, str):
-        try:
-            if "," in mask_input:
-                mask_input = mask_input.split(",")[1]
-            mask_bytes = base64.b64decode(mask_input)
-            mask_img_pil = Image.open(io.BytesIO(mask_bytes)).convert("RGBA")
-            rgba_arr = np.array(mask_img_pil)
-            
-            alpha = rgba_arr[:, :, 3]
-            rgb_max = np.max(rgba_arr[:, :, :3], axis=2)
-            mask_2d = np.zeros((rgba_arr.shape[0], rgba_arr.shape[1]), dtype=np.uint8)
-            mask_2d[(alpha > 0) | (rgb_max > 0)] = curr_code
-        except Exception as e:
-            err_msg = f"Failed to decode base64 mask image: {str(e)}"
-            print(f"[ERROR] {err_msg}")
-            return False, err_msg, {}
-    elif isinstance(mask_input, list):
-        mask_arr = np.asarray(mask_input, dtype=np.uint8)
-        if mask_arr.size == orig_w * orig_h * 4:
-            mask_arr = mask_arr.reshape((orig_h, orig_w, 4))
-            alpha = mask_arr[:, :, 3]
-            mask_2d = np.zeros((orig_h, orig_w), dtype=np.uint8)
-            mask_2d[alpha > 0] = curr_code
-        else:
-            mask_2d = np.where(np.squeeze(mask_arr) > 0, curr_code, 0).astype(np.uint8)
-    else:
-        mask_2d = np.where(np.squeeze(np.array(mask_input)) > 0, curr_code, 0).astype(np.uint8)
-
-    # Apply Nearest-Neighbor Resizing ONLY if dimensions differ from original image
-    if mask_2d.shape != (orig_h, orig_w):
-        logger.info(f"[NEAREST RESIZING] Resizing mask from {mask_2d.shape} to ({orig_h}, {orig_w}) using NEAREST interpolation...")
-        mask_pil = Image.fromarray(mask_2d, mode="L")
-        mask_pil = mask_pil.resize((orig_w, orig_h), resample=Image.NEAREST)
-        mask_2d = np.array(mask_pil, dtype=np.uint8)
-        mask_2d = np.where(mask_2d > 0, curr_code, 0).astype(np.uint8)
-
-    # Print diagnostic [MASK DEBUG] info
-    fg_pixels = int(np.count_nonzero(mask_2d))
-    unique_vals = np.unique(mask_2d).tolist()
-    print("\n[MASK DEBUG]")
-    print("Shape:", mask_2d.shape)
-    print("Dtype:", mask_2d.dtype)
-    print("Unique values:", unique_vals)
-    print("Foreground pixels:", fg_pixels)
-
-    # Check Empty Mask
-    if fg_pixels == 0:
-        empty_msg = "Validation Failed: Empty mask. Please paint at least one lesion region."
-        print(f"[ERROR] {empty_msg}")
-        return False, empty_msg, {}
-
-    # Check Class Code Presence
-    if curr_code > 0 and curr_code not in unique_vals:
-        class_err = f"Validation Failed: Expected class code {curr_code} ({class_name}) was not found in mask values {unique_vals}."
-        print(f"[ERROR] {class_err}")
-        return False, class_err, {}
-
-    # Save single-channel 8-bit uint8 PNG
-    seg_dir = Config.get_segmentation_dir()
-    clean_class = class_name.replace(" ", "_")
-    img_name = os.path.basename(image_path)
-    base_name, _ = os.path.splitext(img_name)
-    mask_name = f"{base_name}_mask.png"
-
-    expected_mask_path = os.path.join(seg_dir, "Annotations", split.capitalize(), clean_class, mask_name)
-    os.makedirs(os.path.dirname(expected_mask_path), exist_ok=True)
-
-    mask_final = Image.fromarray(mask_2d.astype(np.uint8), mode="L")
-    mask_final.save(expected_mask_path)
-
-    is_valid, msg, meta = validate_mask_file(image_path, expected_mask_path, curr_code)
-    meta["expected_mask_path"] = expected_mask_path
-
-    # Update Manifest
-    if manifest_csv is None:
-        manifest_csv = os.path.join(seg_dir, "segmentation_annotation_manifest.csv")
-
-    df_m = pd.read_csv(manifest_csv)
-    match_idx = find_manifest_match_index(df_m, image_path, split)
-    if not match_idx.empty:
-        idx = match_idx[0]
-        if is_valid:
-            df_m.at[idx, "annotation_status"] = "ANNOTATED"
-            df_m.at[idx, "validation_status"] = "PASSED"
-            df_m.at[idx, "error_message"] = "Mask validated and passed"
-        else:
-            df_m.at[idx, "annotation_status"] = "PENDING"
-            df_m.at[idx, "validation_status"] = "FAILED"
-            df_m.at[idx, "error_message"] = msg
-        save_manifest_atomically(df_m, manifest_csv)
-
-        json_manifest_path = manifest_csv.replace(".csv", ".json")
-        report = get_annotation_progress_report(manifest_csv=manifest_csv)
-        save_json_manifest_atomically({
-            "progress_report": report,
-            "manifest_records": df_m.to_dict(orient="records")
-        }, json_manifest_path)
-
-    return is_valid, msg, make_json_safe(meta)
-
-
-def mark_image_skipped(image_path: str, reason: str = "Marked for human review", manifest_csv: Optional[str] = None) -> bool:
-    """Marks a pending image as SKIPPED in the manifest after verifying Test isolation."""
-    seg_dir = Config.get_segmentation_dir()
-    if manifest_csv is None:
-        manifest_csv = os.path.join(seg_dir, "segmentation_annotation_manifest.csv")
-
-    if not os.path.exists(manifest_csv):
-        return False
-
-    df_m = pd.read_csv(manifest_csv)
-    match_idx = find_manifest_match_index(df_m, image_path)
-
-    if not match_idx.empty:
-        idx = match_idx[0]
-        split = str(df_m.at[idx, "split"])
-        assert_annotation_allowed(split, image_path)
-
-        df_m.at[idx, "annotation_status"] = "SKIPPED"
-        df_m.at[idx, "validation_status"] = "UNVALIDATED"
-        df_m.at[idx, "error_message"] = reason
-        save_manifest_atomically(df_m, manifest_csv)
-
-        json_manifest_path = manifest_csv.replace(".csv", ".json")
-        report = get_annotation_progress_report(manifest_csv=manifest_csv)
-        save_json_manifest_atomically({
-            "progress_report": report,
-            "manifest_records": df_m.to_dict(orient="records")
-        }, json_manifest_path)
-
-        logger.info(f"[IMAGE SKIPPED] {image_path} marked as SKIPPED: {reason}")
-        return True
-
-    return False
-
-
-# ---------------------------------------------------------
-# 4. CONTROLLED COLAB CALLBACK REGISTRATION & HANDLERS
-# ---------------------------------------------------------
-def colab_callback_health_check() -> Dict:
-    """Health check callback returning JSON-serializable status."""
-    print("=== C1 CALLBACK HEALTH CHECK ===")
-    print("PYTHON CALLBACK EXECUTED")
     return make_json_safe({
-        "success": True,
-        "message": "COLAB_CALLBACK_WORKING",
-        "status": "HEALTHY"
+        "image_path": str(image_path),
+        "image_name": image_path.name,
+        "class_name": normalize_class_name(
+            row["class_name"]
+        ),
+        "class_code": int(row["class_code"]),
+        "split": str(row["split"]),
+        "width": width,
+        "height": height,
+        "base64": image_to_base64(image_path),
     })
 
 
-def colab_save_mask_handler(image_path, mask_b64, split, class_name, manifest_csv: Optional[str] = None):
-    """Global Colab handler for save_mask with filter preservation and fallback."""
-    print(f"[CALLBACK] notebook.save_mask received: {image_path}")
-    try:
-        assert_annotation_allowed(split, image_path)
-        is_valid, msg, meta = process_annotation_submission(image_path, mask_b64, split, class_name, manifest_csv=manifest_csv)
-        if is_valid:
-            saved_p = meta.get("expected_mask_path", "")
-            print(f"[SUCCESS] Mask saved:\n{saved_p}")
-            # Resolving next pending image matching active filter with fallbacks
-            next_item = get_next_pending_image(split=split, class_name=class_name, manifest_csv=manifest_csv)
-            if next_item is None and class_name is not None:
-                next_item = get_next_pending_image(split=split, class_name=None, manifest_csv=manifest_csv)
-            if next_item is None:
-                next_item = get_next_pending_image(split=None, class_name=None, manifest_csv=manifest_csv)
+# ============================================================
+# MASK VALIDATION
+# ============================================================
 
-            report = get_annotation_progress_report(manifest_csv=manifest_csv)
-            payload = prepare_image_payload(next_item, manifest_csv=manifest_csv) if next_item else None
-            return make_json_safe({
-                "success": True,
-                "status": "ANNOTATED",
-                "message": msg,
-                "image_path": image_path,
-                "next_item": payload,
-                "progress": report
-            })
+def validate_mask_array(
+    image_path: str | Path,
+    mask_array: np.ndarray,
+    expected_class_code: int,
+) -> Tuple[bool, str, Dict[str, Any]]:
+
+    meta: Dict[str, Any] = {}
+
+    image_path = Path(image_path)
+
+    if not image_path.exists():
+        return (
+            False,
+            "Image does not exist.",
+            {"error_code": "IMAGE_NOT_FOUND"},
+        )
+
+    with Image.open(image_path) as img:
+        expected_w = img.width
+        expected_h = img.height
+
+    arr = np.asarray(mask_array)
+
+    if arr.ndim == 3:
+
+        if arr.shape[-1] == 4:
+            alpha = arr[..., 3]
+
+            # Transparent pixels are background.
+            rgb = arr[..., :3]
+
+            gray = np.asarray(
+                Image.fromarray(
+                    rgb.astype(np.uint8)
+                ).convert("L")
+            )
+
+            gray[alpha == 0] = 0
+            arr = gray
+
         else:
-            print(f"[ERROR] Validation failed: {msg}")
+            arr = np.asarray(
+                Image.fromarray(
+                    arr.astype(np.uint8)
+                ).convert("L")
+            )
+
+    if arr.ndim != 2:
+        return (
+            False,
+            "Mask must be 2-dimensional.",
+            {"error_code": "INVALID_DIMENSIONS"},
+        )
+
+    if not np.issubdtype(arr.dtype, np.integer):
+        arr = arr.astype(np.uint8)
+
+    arr = arr.astype(np.uint8)
+
+    meta["original_mask_dimensions"] = [
+        int(arr.shape[0]),
+        int(arr.shape[1]),
+    ]
+
+    unique_values = set(
+        np.unique(arr).astype(int).tolist()
+    )
+
+    invalid_values = unique_values - VALID_MASK_VALUES
+
+    if invalid_values:
+        return (
+            False,
+            f"Invalid pixel values {sorted(invalid_values)}. "
+            f"Only 0-4 allowed.",
+            {
+                "error_code": "INVALID_PIXEL_VALUES",
+                "invalid_values": sorted(invalid_values),
+            },
+        )
+
+    if arr.shape != (expected_h, expected_w):
+
+        pil_mask = Image.fromarray(arr, mode="L")
+
+        pil_mask = pil_mask.resize(
+            (expected_w, expected_h),
+            Image.Resampling.NEAREST,
+        )
+
+        arr = np.asarray(
+            pil_mask,
+            dtype=np.uint8,
+        )
+
+        meta["resized"] = True
+
+    else:
+        meta["resized"] = False
+
+    if np.count_nonzero(arr) == 0:
+        return (
+            False,
+            "Empty mask. Paint the visible lesion before saving.",
+            {
+                "error_code": "EMPTY_MASK",
+                "mask_dimensions": [
+                    expected_h,
+                    expected_w,
+                ],
+            },
+        )
+
+    present_values = set(
+        np.unique(arr).astype(int).tolist()
+    )
+
+    if expected_class_code not in present_values:
+        return (
+            False,
+            f"Expected class code {expected_class_code} "
+            "was not found in the mask.",
+            {
+                "error_code": "MISSING_EXPECTED_CLASS",
+                "present_values": sorted(present_values),
+            },
+        )
+
+    meta["mask_dimensions"] = [
+        int(arr.shape[0]),
+        int(arr.shape[1]),
+    ]
+
+    meta["unique_values"] = sorted(
+        present_values
+    )
+
+    meta["foreground_pixels"] = int(
+        np.count_nonzero(arr)
+    )
+
+    meta["expected_class_code"] = int(
+        expected_class_code
+    )
+
+    return True, "Mask validation passed.", meta
+
+
+def validate_mask_file(
+    image_path: str | Path,
+    mask_path: str | Path,
+    expected_class_code: int,
+) -> Tuple[bool, str, Dict[str, Any]]:
+
+    mask_path = Path(mask_path)
+
+    if not mask_path.exists():
+        return (
+            False,
+            "Mask file does not exist.",
+            {"error_code": "MASK_NOT_FOUND"},
+        )
+
+    try:
+
+        with Image.open(mask_path) as img:
+            img.load()
+
+            if img.mode == "RGBA":
+                arr = np.asarray(img)
+
+            else:
+                arr = np.asarray(
+                    img.convert("L")
+                )
+
+        return validate_mask_array(
+            image_path,
+            arr,
+            expected_class_code,
+        )
+
+    except Exception as exc:
+
+        return (
+            False,
+            f"Could not read mask: {exc}",
+            {
+                "error_code": "MASK_READ_ERROR",
+                "exception": str(exc),
+            },
+        )
+
+
+# ============================================================
+# SAVE MASK
+# ============================================================
+
+def process_annotation_submission(
+    image_path: str | Path,
+    mask_array: np.ndarray,
+    split: str,
+    class_name: str,
+    manifest_csv: str | Path | None = None,
+) -> Tuple[bool, str, Dict[str, Any]]:
+
+    manifest_path = Path(
+        manifest_csv or get_manifest_path()
+    )
+
+    expected_code = get_class_code(class_name)
+
+    test_csv = get_preprocessed_dir() / "test_split.csv"
+
+    try:
+
+        assert_annotation_allowed(
+            split,
+            image_path,
+            test_csv if test_csv.exists() else None,
+        )
+
+    except PermissionError as exc:
+
+        return (
+            False,
+            str(exc),
+            {
+                "error_code": "ANNOTATION_NOT_ALLOWED",
+            },
+        )
+
+    df = load_manifest(manifest_path)
+
+    normalized_path = os.path.normcase(
+        os.path.abspath(str(image_path))
+    )
+
+    matches = df[
+        df["image_path"].apply(
+            lambda x: os.path.normcase(
+                os.path.abspath(str(x))
+            )
+        ) == normalized_path
+    ]
+
+    if matches.empty:
+
+        return (
+            False,
+            "Image was not found in annotation manifest.",
+            {
+                "error_code": "IMAGE_NOT_IN_MANIFEST",
+            },
+        )
+
+    idx = matches.index[0]
+
+    row_split = str(df.loc[idx, "split"])
+
+    if row_split != str(split):
+
+        return (
+            False,
+            "Requested split does not match manifest split.",
+            {
+                "error_code": "SPLIT_MISMATCH",
+            },
+        )
+
+    try:
+
+        allowed, message, meta = validate_mask_array(
+            image_path,
+            mask_array,
+            expected_code,
+        )
+
+        if not allowed:
+
+            df.loc[idx, "validation_status"] = "FAILED"
+            df.loc[idx, "error_message"] = message
+
+            save_manifest_atomically(
+                df,
+                manifest_path,
+            )
+
+            return False, message, meta
+
+        arr = np.asarray(mask_array)
+
+        if arr.ndim == 3:
+            arr = np.asarray(
+                Image.fromarray(
+                    arr.astype(np.uint8)
+                ).convert("L")
+            )
+
+        arr = arr.astype(np.uint8)
+
+        with Image.open(image_path) as img:
+            width, height = img.width, img.height
+
+        if arr.shape != (height, width):
+
+            arr = np.asarray(
+                Image.fromarray(
+                    arr,
+                    mode="L",
+                ).resize(
+                    (width, height),
+                    Image.Resampling.NEAREST,
+                ),
+                dtype=np.uint8,
+            )
+
+        mask_path = Path(
+            str(df.loc[idx, "expected_mask_path"])
+        )
+
+        mask_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        temp_mask = mask_path.with_suffix(
+            ".tmp.png"
+        )
+
+        Image.fromarray(
+            arr,
+            mode="L",
+        ).save(
+            temp_mask,
+            format="PNG",
+        )
+
+        # Validate saved mask before replacing final file.
+        valid_saved, saved_msg, saved_meta = (
+            validate_mask_file(
+                image_path,
+                temp_mask,
+                expected_code,
+            )
+        )
+
+        if not valid_saved:
+
+            if temp_mask.exists():
+                temp_mask.unlink()
+
+            df.loc[idx, "validation_status"] = "FAILED"
+            df.loc[idx, "error_message"] = saved_msg
+
+            save_manifest_atomically(
+                df,
+                manifest_path,
+            )
+
+            return False, saved_msg, saved_meta
+
+        os.replace(
+            temp_mask,
+            mask_path,
+        )
+
+        df.loc[idx, "annotation_status"] = "ANNOTATED"
+        df.loc[idx, "validation_status"] = "PASSED"
+        df.loc[idx, "error_message"] = ""
+
+        save_manifest_atomically(
+            df,
+            manifest_path,
+        )
+
+        meta["mask_path"] = str(mask_path)
+
+        return (
+            True,
+            "Mask validated and saved.",
+            meta,
+        )
+
+    except Exception as exc:
+
+        return (
+            False,
+            f"Annotation processing failed: {exc}",
+            {
+                "error_code": "PROCESSING_ERROR",
+                "exception": str(exc),
+            },
+        )
+
+
+# ============================================================
+# SKIP
+# ============================================================
+
+def mark_image_skipped(
+    image_path: str | Path,
+    reason: str = "Manual review skipped",
+    manifest_csv: str | Path | None = None,
+) -> bool:
+
+    manifest_path = Path(
+        manifest_csv or get_manifest_path()
+    )
+
+    df = load_manifest(manifest_path)
+
+    normalized = os.path.normcase(
+        os.path.abspath(str(image_path))
+    )
+
+    matches = df[
+        df["image_path"].apply(
+            lambda x: os.path.normcase(
+                os.path.abspath(str(x))
+            )
+        ) == normalized
+    ]
+
+    if matches.empty:
+        return False
+
+    idx = matches.index[0]
+
+    split = str(df.loc[idx, "split"])
+
+    if split not in ANNOTATABLE_SPLITS:
+        raise PermissionError(
+            "Test split cannot be skipped or modified."
+        )
+
+    df.loc[idx, "annotation_status"] = "SKIPPED"
+    df.loc[idx, "validation_status"] = "UNVALIDATED"
+    df.loc[idx, "error_message"] = str(reason)
+
+    save_manifest_atomically(
+        df,
+        manifest_path,
+    )
+
+    return True
+
+
+# ============================================================
+# PROGRESS
+# ============================================================
+
+def get_annotation_progress_report(
+    manifest_csv: str | Path | None = None,
+) -> Dict[str, Any]:
+
+    df = load_manifest(manifest_csv)
+
+    eligible = df[
+        df["split"].isin(ANNOTATABLE_SPLITS)
+    ]
+
+    total = len(eligible)
+
+    annotated = int(
+        (
+            eligible["annotation_status"]
+            == "ANNOTATED"
+        ).sum()
+    )
+
+    passed = int(
+        (
+            eligible["validation_status"]
+            == "PASSED"
+        ).sum()
+    )
+
+    skipped = int(
+        (
+            eligible["annotation_status"]
+            == "SKIPPED"
+        ).sum()
+    )
+
+    pending = int(
+        (
+            eligible["annotation_status"]
+            == "PENDING"
+        ).sum()
+    )
+
+    percentage = (
+        round((annotated + skipped) / total * 100, 2)
+        if total > 0
+        else 100.0
+    )
+
+    return make_json_safe({
+        "total_eligible_images": total,
+        "annotated_count": annotated,
+        "passed_validation_count": passed,
+        "skipped_review_count": skipped,
+        "pending_count": pending,
+        "progress_percentage": percentage,
+        "test_images_isolated": int(
+            (df["split"] == "Test").sum()
+        ),
+    })
+
+
+# ============================================================
+# CALLBACKS
+# ============================================================
+
+_CALLBACK_REGISTRATION = {}
+
+
+def colab_callback_health_check() -> Dict[str, Any]:
+
+    return {
+        "success": True,
+        "status": "HEALTHY",
+        "message": "COLAB_CALLBACK_WORKING",
+    }
+
+
+def colab_save_mask_handler(
+    image_path: str,
+    mask_base64: str,
+    split: str,
+    class_name: str,
+    manifest_csv: str | Path | None = None,
+) -> Dict[str, Any]:
+
+    try:
+
+        if not isinstance(mask_base64, str):
+            raise ValueError(
+                "Mask payload must be a base64 string."
+            )
+
+        if "," in mask_base64:
+            mask_base64 = mask_base64.split(
+                ",",
+                1,
+            )[1]
+
+        raw = base64.b64decode(
+            mask_base64,
+            validate=True,
+        )
+
+        with Image.open(
+            io.BytesIO(raw)
+        ) as img:
+
+            if img.mode == "RGBA":
+                arr = np.asarray(img)
+
+                alpha = arr[..., 3]
+                rgb = arr[..., :3]
+
+                gray = np.asarray(
+                    Image.fromarray(
+                        rgb.astype(np.uint8)
+                    ).convert("L")
+                )
+
+                gray[alpha == 0] = 0
+                mask_array = gray
+
+            else:
+                mask_array = np.asarray(
+                    img.convert("L")
+                )
+
+        success, message, meta = (
+            process_annotation_submission(
+                image_path,
+                mask_array,
+                split,
+                class_name,
+                manifest_csv,
+            )
+        )
+
+        if not success:
+
             return make_json_safe({
                 "success": False,
-                "status": "FAILED",
-                "message": msg,
-                "image_path": image_path,
+                "message": message,
+                "meta": meta,
+                "progress":
+                    get_annotation_progress_report(
+                        manifest_csv
+                    ),
                 "next_item": None,
-                "progress": get_annotation_progress_report(manifest_csv=manifest_csv)
             })
-    except Exception as e:
-        err_detail = traceback.format_exc()
-        print(f"[C1 CALLBACK ERROR] {str(e)}\n{err_detail}")
-        return make_json_safe({
-            "success": False,
-            "status": "ERROR",
-            "message": str(e),
-            "image_path": image_path,
-            "next_item": None,
-            "error_type": type(e).__name__
-        })
 
+        next_item = get_next_pending_image(
+            split=split,
+            class_name=class_name,
+            manifest_csv=manifest_csv,
+        )
 
-def colab_skip_image_handler(image_path, reason="Marked for human review", split="Train", class_name=None, manifest_csv: Optional[str] = None):
-    """Global Colab handler for skip_image with filter preservation and fallback."""
-    print(f"[CALLBACK] notebook.skip_image received: {image_path}")
-    try:
-        assert_annotation_allowed(split, image_path)
-        res = mark_image_skipped(image_path, reason, manifest_csv=manifest_csv)
-        print(f"[SUCCESS] Image skipped:\n{image_path}")
-        # Resolving next pending image matching active filter with fallbacks
-        next_item = get_next_pending_image(split=split, class_name=class_name, manifest_csv=manifest_csv)
-        if next_item is None and class_name is not None:
-            next_item = get_next_pending_image(split=split, class_name=None, manifest_csv=manifest_csv)
         if next_item is None:
-            next_item = get_next_pending_image(split=None, class_name=None, manifest_csv=manifest_csv)
+            next_item = get_next_pending_image(
+                manifest_csv=manifest_csv,
+            )
 
-        report = get_annotation_progress_report(manifest_csv=manifest_csv)
-        payload = prepare_image_payload(next_item, manifest_csv=manifest_csv) if next_item else None
         return make_json_safe({
-            "success": res,
-            "status": "SKIPPED",
-            "message": "Image marked skipped",
-            "image_path": image_path,
-            "next_item": payload,
-            "progress": report
+            "success": True,
+            "message": message,
+            "meta": meta,
+            "progress":
+                get_annotation_progress_report(
+                    manifest_csv
+                ),
+            "next_item": next_item,
         })
-    except Exception as e:
-        err_detail = traceback.format_exc()
-        print(f"[C1 CALLBACK ERROR] {str(e)}\n{err_detail}")
-        return make_json_safe({
+
+    except Exception as exc:
+
+        return {
             "success": False,
-            "status": "ERROR",
-            "message": str(e),
-            "image_path": image_path,
+            "message": f"Save callback failed: {exc}",
             "next_item": None,
-            "error_type": type(e).__name__
+        }
+
+
+def colab_skip_image_handler(
+    image_path: str,
+    reason: str,
+    split: str,
+    class_name: str,
+    manifest_csv: str | Path | None = None,
+) -> Dict[str, Any]:
+
+    try:
+
+        manifest_path = Path(
+            manifest_csv or get_manifest_path()
+        )
+
+        # Never permit Test modifications.
+        if str(split) not in ANNOTATABLE_SPLITS:
+            raise PermissionError(
+                "Test split is read-only."
+            )
+
+        success = mark_image_skipped(
+            image_path,
+            reason,
+            manifest_path,
+        )
+
+        if not success:
+            return {
+                "success": False,
+                "message": "Image was not found in manifest.",
+                "next_item": None,
+            }
+
+        next_item = get_next_pending_image(
+            split=split,
+            class_name=class_name,
+            manifest_csv=manifest_path,
+        )
+
+        if next_item is None:
+            next_item = get_next_pending_image(
+                split=split,
+                manifest_csv=manifest_path,
+            )
+
+        if next_item is None:
+            next_item = get_next_pending_image(
+                manifest_csv=manifest_path,
+            )
+
+        return make_json_safe({
+            "success": True,
+            "message": "Image marked skipped.",
+            "progress":
+                get_annotation_progress_report(
+                    manifest_path
+                ),
+            "next_item": next_item,
         })
 
+    except Exception as exc:
 
-_CALLBACKS_REGISTERED = False
+        return {
+            "success": False,
+            "message": f"Skip callback failed: {exc}",
+            "next_item": None,
+        }
+
 
 def register_colab_callbacks() -> Dict[str, Any]:
-    """
-    Explicitly registers Colab callbacks once and exposes registration status.
-    Idempotent: Multiple calls return the registered callback dictionary safely.
-    """
-    global _CALLBACKS_REGISTERED
-    cb_dict = {
-        "test.callback": colab_callback_health_check,
-        "notebook.save_mask": colab_save_mask_handler,
-        "notebook.skip_image": colab_skip_image_handler
+
+    callbacks = {
+        "notebook.save_mask":
+            colab_save_mask_handler,
+
+        "notebook.skip_image":
+            colab_skip_image_handler,
     }
 
-    if not COLAB_AVAILABLE:
-        print("[COLAB REGISTRATION] Google Colab output module not detected (Local execution).")
-        return {
-            "success": False,
-            "registered": [],
-            "environment": "LOCAL_JUPYTER_OR_PYTHON",
-            "message": "google.colab.output not available",
-            "callbacks": cb_dict
-        }
-
     try:
+
         from google.colab import output
-        if not _CALLBACKS_REGISTERED:
-            output.register_callback("test.callback", colab_callback_health_check)
-            output.register_callback("notebook.save_mask", colab_save_mask_handler)
-            output.register_callback("notebook.skip_image", colab_skip_image_handler)
-            _CALLBACKS_REGISTERED = True
-            print("=== COLAB CALLBACK REGISTRATION SUCCESS ===")
-            print("Registered callbacks: test.callback, notebook.save_mask, notebook.skip_image")
+
+        output.register_callback(
+            "notebook.save_mask",
+            colab_save_mask_handler,
+        )
+
+        output.register_callback(
+            "notebook.skip_image",
+            colab_skip_image_handler,
+        )
+
+        _CALLBACK_REGISTRATION.update(callbacks)
+
         return {
             "success": True,
-            "registered": [
-                "test.callback",
-                "notebook.save_mask",
-                "notebook.skip_image"
-            ],
-            "environment": "GOOGLE_COLAB",
-            "callbacks": cb_dict
+            "callbacks": list(callbacks.keys()),
+            "message": "Callbacks registered successfully.",
         }
-    except Exception as e:
-        print(f"[COLAB REGISTRATION ERROR] Failed to register callbacks: {e}")
+
+    except Exception as exc:
+
+        _CALLBACK_REGISTRATION.update(callbacks)
+
         return {
             "success": False,
-            "registered": [],
-            "environment": "GOOGLE_COLAB_ERROR",
-            "message": str(e),
-            "callbacks": cb_dict
+            "callbacks": list(callbacks.keys()),
+            "message": f"Callback registration unavailable: {exc}",
         }
 
 
-if COLAB_AVAILABLE:
-    register_colab_callbacks()
+# ============================================================
+# RESPONSE DECODER
+# ============================================================
 
+def decode_colab_response_payload(
+    response: Any,
+) -> Any:
 
-# ---------------------------------------------------------
-# 5. MINIMAL CALLBACK DIAGNOSTIC SUITE
-# ---------------------------------------------------------
-def run_minimal_colab_callback_test():
-    """
-    Renders a minimal HTML/JS button to verify bi-directional Colab callback execution.
-    Clicking button prints: === C1 CALLBACK HEALTH CHECK === and PYTHON CALLBACK EXECUTED.
-    """
-    if COLAB_AVAILABLE:
-        register_colab_callbacks()
-
-    html_code = """
-    <div style="padding:15px; border:2px solid #28A745; border-radius:6px; background:#F4F9F5; font-family:Arial, sans-serif;">
-        <h4 style="margin-top:0; color:#28A745;">🧪 Minimal Google Colab Callback Health Check</h4>
-        <p>Click the button below to test bi-directional JavaScript to Python communication.</p>
-        <button onclick="triggerHealthCheck()" style="background:#28A745; color:white; border:none; padding:10px 18px; border-radius:4px; font-weight:bold; cursor:pointer;">
-            TEST COLAB CALLBACK
-        </button>
-        <div id="health-output" style="margin-top:10px; font-weight:bold; color:#1F497D;">Status: Ready to test...</div>
-    </div>
-
-    <script>
-    function triggerHealthCheck() {
-        document.getElementById('health-output').innerText = "⏳ Invoking test.callback...";
-        if (window.google && google.colab && google.colab.kernel) {
-            google.colab.kernel.invokeFunction('test.callback', [], {})
-                .then(function(res) {
-                    var out = null;
-                    if (res && res.data) {
-                        out = res.data['application/json'] || res.data['text/plain'] || res.data;
-                    }
-                    if (typeof out === 'string') { try { out = JSON.parse(out); } catch(e){} }
-                    document.getElementById('health-output').style.color = "#28A745";
-                    document.getElementById('health-output').innerText = "CALLBACK WORKING (" + JSON.stringify(out) + ")";
-                }).catch(function(err) {
-                    document.getElementById('health-output').style.color = "#DC3545";
-                    document.getElementById('health-output').innerText = "❌ Callback Error: " + err;
-                });
-        } else {
-            document.getElementById('health-output').innerText = "Local Jupyter environment detected (not Colab runtime).";
-        }
-    }
-    </script>
-    """
-    try:
-        from IPython.display import HTML, display
-        display(HTML(html_code))
-    except ImportError:
-        print("[MINIMAL TEST] Open in Jupyter/Colab notebook to interactively test button.")
-
-
-# ---------------------------------------------------------
-# 6. GOOGLE COLAB INTERACTIVE CANVAS DISPLAY ENGINE
-# ---------------------------------------------------------
-def launch_colab_annotation_interface(
-    split: Optional[str] = "Train",
-    class_name: Optional[str] = None,
-    pilot: bool = False,
-    auto_resume: bool = True,
-    debug_ui: bool = False
-):
-    """
-    Renders an interactive HTML5 Canvas drawing widget directly inside Google Colab or Jupyter notebooks.
-    Supports mouse/touch Pointer Events, bounded Undo/Redo history, dynamic dimension resets, and in-place DOM updates.
-    """
-    if COLAB_AVAILABLE:
-        register_colab_callbacks()
-
-    if pilot:
-        split = "Train"
-        print("=== PILOT ANNOTATION WORKFLOW ACTIVE ===")
-        print("Target: 10 images per class from TRAIN (Total = 40 candidate pilot images for human annotation)")
-
-    next_item = get_next_pending_image(split=split, class_name=class_name)
-    rep = get_annotation_progress_report()
-
-    if next_item is None:
-        print("\n🎉 ALL ELIGIBLE TRAIN/VALIDATION IMAGES ARE ANNOTATED OR NONE MATCH FILTERS! 🎉")
-        print(f"Total Eligible : {rep['total_eligible_images']}")
-        print(f"Annotated      : {rep['annotated_count']}")
-        print(f"Passed         : {rep['passed_validation_count']}")
-        print(f"Progress       : {rep['progress_percentage']}%\n")
-        return
-
-    payload = prepare_image_payload(next_item)
-    if not payload:
-        print("Could not load image payload. Re-trying...")
-        return launch_colab_annotation_interface(split=split, class_name=class_name, debug_ui=debug_ui)
-
-    img_path = payload["image_path"]
-    curr_split = payload["split"]
-    curr_class = payload["class_name"]
-    curr_code = payload["class_code"]
-    w = payload["width"]
-    h = payload["height"]
-    img_b64 = payload["base64"]
-
-    disp_w = min(600, w)
-    disp_h = max(1, min(600 * h // w, h)) if w > 0 else 600
-
-    # Safe JSON string escaping for JavaScript block
-    img_path_js = json.dumps(img_path)
-    curr_split_js = json.dumps(curr_split)
-    curr_class_js = json.dumps(curr_class)
-    debug_ui_js = "true" if debug_ui else "false"
-
-    html_code = f"""
-    <div id="annotation-widget-container" style="font-family: Arial, sans-serif; max-width: 920px; padding: 18px; border: 2px solid #1F497D; border-radius: 8px; background-color: #F8F9FA;">
-        <h3 style="margin-top:0; color:#1F497D;">🎨 Cashew Leaf Manual Segmentation Tool (Phase C.1 Repaired)</h3>
-        
-        <!-- Live Progress Banner -->
-        <div style="background:#E9ECEF; padding:12px; border-radius:6px; margin-bottom:12px; font-size:13px; display:flex; flex-wrap:wrap; gap:15px; justify-content:space-between;">
-            <div><strong>Eligible Pool:</strong> {rep['total_eligible_images']} (Train=4013, Val=860)</div>
-            <div><strong>Isolated Test Set:</strong> {rep['test_images_isolated']} (Read-Only)</div>
-            <div><strong>Annotated:</strong> <span id="stat-annotated" style="color:#28A745; font-weight:bold;">{rep['annotated_count']}</span></div>
-            <div><strong>Passed Validation:</strong> <span id="stat-passed" style="color:#28A745; font-weight:bold;">{rep['passed_validation_count']}</span></div>
-            <div><strong>Skipped:</strong> <span id="stat-skipped" style="color:#FFC107; font-weight:bold;">{rep['skipped_review_count']}</span></div>
-            <div><strong>Pending:</strong> <span id="stat-pending" style="color:#DC3545; font-weight:bold;">{rep['pending_count']}</span></div>
-            <div><strong>Progress:</strong> <span id="stat-progress" style="color:#1F497D; font-weight:bold;">{rep['progress_percentage']}%</span></div>
-        </div>
-
-        <div style="display: flex; gap: 15px; margin-bottom: 12px; background:#FFF; padding:10px; border:1px solid #DEE2E6; border-radius:4px;">
-            <div><strong>Current Split:</strong> <span id="lbl-split" style="color:#2b5c8f; font-weight:bold;">{curr_split}</span></div>
-            <div><strong>Target Class:</strong> <span id="lbl-class" style="color:#e07a5f; font-weight:bold;">{curr_class} (Code {curr_code})</span></div>
-            <div><strong>Dimensions:</strong> <span id="lbl-dims">{w} x {h} px</span></div>
-            <div><strong>File:</strong> <span id="lbl-file" style="font-family:monospace;">{os.path.basename(img_path)}</span></div>
-        </div>
-
-        <!-- Controls Bar -->
-        <div style="background:#E9ECEF; padding:10px; border-radius:5px; margin-bottom:12px; display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
-            <label><strong>Brush Size:</strong> <input type="range" id="brush-size" min="1" max="50" value="14" oninput="updateBrushSize(this.value)"><span id="brush-val">14</span>px</label>
-            <button onclick="setMode('brush')" id="btn-brush" style="background:#1F497D; color:white; border:none; padding:6px 12px; border-radius:4px; cursor:pointer; font-weight:bold;">🖌️ Paint Lesion</button>
-            <button onclick="setMode('eraser')" id="btn-eraser" style="background:#6C757D; color:white; border:none; padding:6px 12px; border-radius:4px; cursor:pointer; font-weight:bold; opacity:0.6;">🧹 Eraser (Code 0)</button>
-            <button onclick="undoStroke()" style="background:#17A2B8; color:white; border:none; padding:6px 12px; border-radius:4px; cursor:pointer; font-weight:bold;">↩️ Undo</button>
-            <button onclick="redoStroke()" style="background:#6C757D; color:white; border:none; padding:6px 12px; border-radius:4px; cursor:pointer; font-weight:bold;">↪️ Redo</button>
-            <button onclick="clearCanvas()" style="background:#DC3545; color:white; border:none; padding:6px 12px; border-radius:4px; cursor:pointer; font-weight:bold;">🗑️ Clear</button>
-        </div>
-
-        <!-- Canvas Wrapper -->
-        <div id="canvas-wrapper" style="position: relative; width: {disp_w}px; height: {disp_h}px; border:2px solid #1F497D; margin:0 auto; background:#000; overflow:hidden;">
-            <img id="bg-img" src="data:image/jpeg;base64,{img_b64}" style="position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; z-index:1; object-fit:contain;">
-            <canvas id="display-canvas" width="{w}" height="{h}" style="position:absolute; left:0; top:0; width:100%; height:100%; z-index:2; pointer-events:auto; touch-action:none; cursor:crosshair;"></canvas>
-        </div>
-
-        <!-- Status & Action Bar -->
-        <div style="margin-top:15px; display:flex; justify-content:space-between; align-items:center;">
-            <div id="status-msg" style="font-weight:bold; color:#1F497D; font-size:14px;">Ready: Paint visible affected lesion and click Save Mask & Next.</div>
-            <div style="display:flex; gap:10px;">
-                <button onclick="skipImage()" id="btn-skip" style="background:#FFC107; color:black; border:none; padding:10px 18px; border-radius:4px; font-weight:bold; cursor:pointer;">⏭️ Skip for Review</button>
-                <button onclick="saveAndNext()" id="btn-save" style="background:#28A745; color:white; border:none; padding:10px 18px; border-radius:4px; font-weight:bold; cursor:pointer;">💾 Save Mask & Next</button>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        var DEBUG_UI = {debug_ui_js};
-        var currentImgPath = {img_path_js};
-        var currentSplit = {curr_split_js};
-        var currentClass = {curr_class_js};
-        var currentCode = {curr_code};
-
-        function logDebug(msg, obj) {{
-            if (!DEBUG_UI) return;
-            if (obj !== undefined) {{
-                if (typeof obj === 'object' && obj !== null) {{
-                    var clone = Object.assign({{}}, obj);
-                    if (clone.base64) clone.base64 = "[base64 len=" + clone.base64.length + "]";
-                    console.log("[C1 UI] " + msg, clone);
-                }} else {{
-                    console.log("[C1 UI] " + msg, obj);
-                }}
-            }} else {{
-                console.log("[C1 UI] " + msg);
-            }}
-        }}
-
-        var displayCanvas = document.getElementById('display-canvas');
-        var displayCtx = displayCanvas.getContext('2d');
-
-        var maskCanvas = document.createElement('canvas');
-        maskCanvas.width = displayCanvas.width;
-        maskCanvas.height = displayCanvas.height;
-        var maskCtx = maskCanvas.getContext('2d');
-
-        var isDrawing = false;
-        var mode = 'brush';
-        var brushSize = 14;
-        var undoStack = [];
-        var redoStack = [];
-        var lastPos = null;
-
-        saveState();
-
-        function saveState() {{
-            undoStack.push(maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height));
-            if (undoStack.length > 25) undoStack.shift();
-            redoStack = [];
-            renderMaskOverlay();
-        }}
-
-        function undoStroke() {{
-            if (undoStack.length > 1) {{
-                redoStack.push(undoStack.pop());
-                var state = undoStack[undoStack.length - 1];
-                maskCtx.putImageData(state, 0, 0);
-                renderMaskOverlay();
-            }}
-        }}
-
-        function redoStroke() {{
-            if (redoStack.length > 0) {{
-                var state = redoStack.pop();
-                undoStack.push(state);
-                maskCtx.putImageData(state, 0, 0);
-                renderMaskOverlay();
-            }}
-        }}
-
-        function clearCanvas() {{
-            maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
-            saveState();
-        }}
-
-        function updateBrushSize(val) {{
-            brushSize = parseInt(val);
-            document.getElementById('brush-val').innerText = val;
-        }}
-
-        function setMode(m) {{
-            mode = m;
-            document.getElementById('btn-brush').style.opacity = (m === 'brush') ? '1.0' : '0.6';
-            document.getElementById('btn-eraser').style.opacity = (m === 'eraser') ? '1.0' : '0.6';
-        }}
-
-        function getPos(e) {{
-            var rect = displayCanvas.getBoundingClientRect();
-            var scaleX = maskCanvas.width / rect.width;
-            var scaleY = maskCanvas.height / rect.height;
-            var clientX = e.clientX || (e.touches && e.touches[0] ? e.touches[0].clientX : 0);
-            var clientY = e.clientY || (e.touches && e.touches[0] ? e.touches[0].clientY : 0);
-            return {{
-                x: (clientX - rect.left) * scaleX,
-                y: (clientY - rect.top) * scaleY
-            }};
-        }}
-
-        displayCanvas.addEventListener('pointerdown', function(e) {{
-            isDrawing = true;
-            displayCanvas.setPointerCapture(e.pointerId);
-            lastPos = getPos(e);
-            draw(e);
-        }});
-        displayCanvas.addEventListener('pointermove', function(e) {{
-            if (isDrawing) draw(e);
-        }});
-        displayCanvas.addEventListener('pointerup', function(e) {{
-            if (isDrawing) {{
-                isDrawing = false;
-                lastPos = null;
-                saveState();
-            }}
-        }});
-        displayCanvas.addEventListener('pointerleave', function(e) {{
-            if (isDrawing && !displayCanvas.hasPointerCapture(e.pointerId)) {{
-                isDrawing = false;
-                lastPos = null;
-                saveState();
-            }}
-        }});
-        displayCanvas.addEventListener('pointercancel', function(e) {{
-            if (isDrawing) {{
-                isDrawing = false;
-                lastPos = null;
-                saveState();
-            }}
-        }});
-
-        function draw(e) {{
-            if (!isDrawing || !lastPos) return;
-            e.preventDefault();
-            var currPos = getPos(e);
-            maskCtx.lineWidth = brushSize;
-            maskCtx.lineCap = 'round';
-            maskCtx.lineJoin = 'round';
-            
-            if (mode === 'brush') {{
-                maskCtx.globalCompositeOperation = 'source-over';
-                maskCtx.fillStyle = 'rgb(' + currentCode + ',' + currentCode + ',' + currentCode + ')';
-                maskCtx.strokeStyle = maskCtx.fillStyle;
-                
-                maskCtx.beginPath();
-                maskCtx.moveTo(lastPos.x, lastPos.y);
-                maskCtx.lineTo(currPos.x, currPos.y);
-                maskCtx.stroke();
-                
-                maskCtx.beginPath();
-                maskCtx.arc(currPos.x, currPos.y, brushSize / 2, 0, Math.PI * 2);
-                maskCtx.fill();
-            }} else {{
-                maskCtx.globalCompositeOperation = 'destination-out';
-                maskCtx.fillStyle = 'rgba(0,0,0,1)';
-                maskCtx.strokeStyle = 'rgba(0,0,0,1)';
-                
-                maskCtx.beginPath();
-                maskCtx.moveTo(lastPos.x, lastPos.y);
-                maskCtx.lineTo(currPos.x, currPos.y);
-                maskCtx.stroke();
-                
-                maskCtx.beginPath();
-                maskCtx.arc(currPos.x, currPos.y, brushSize / 2, 0, Math.PI * 2);
-                maskCtx.fill();
-            }}
-            lastPos = currPos;
-            renderMaskOverlay();
-        }}
-
-        function renderMaskOverlay() {{
-            displayCtx.clearRect(0, 0, displayCanvas.width, displayCanvas.height);
-            var maskData = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
-            var overlayData = displayCtx.createImageData(displayCanvas.width, displayCanvas.height);
-            
-            for (var i = 0; i < maskData.data.length; i += 4) {{
-                var code = maskData.data[i];
-                if (code > 0) {{
-                    overlayData.data[i]     = (code == 1 ? 255 : (code == 4 ? 255 : 0));
-                    overlayData.data[i + 1] = (code == 2 ? 255 : (code == 4 ? 255 : 0));
-                    overlayData.data[i + 2] = (code == 3 ? 255 : 0);
-                    overlayData.data[i + 3] = 180; // 70% opacity visual overlay
-                }}
-            }}
-            displayCtx.putImageData(overlayData, 0, 0);
-        }}
-
-        function getRawMaskBase64() {{
-            return maskCanvas.toDataURL('image/png');
-        }}
-
-        function parseColabResponse(res) {{
-            if (!res) return null;
-            var payload = (res && res.data) ? res.data : res;
-            var out = payload['application/json'] || payload['text/plain'] || payload;
-            if (typeof out === 'string') {{
-                try {{ out = JSON.parse(out); }} catch(e) {{}}
-            }}
-            if (typeof out === 'string') {{
-                try {{ out = JSON.parse(out); }} catch(e) {{}}
-            }}
-            if (out && typeof out === 'object') {{
-                if (out.data && (out.data['application/json'] || out.data['text/plain'])) {{
-                    var sub = out.data['application/json'] || out.data['text/plain'];
-                    if (typeof sub === 'string') {{
-                        try {{ sub = JSON.parse(sub); }} catch(e) {{}}
-                    }}
-                    if (sub && typeof sub === 'object') out = sub;
-                }}
-            }}
-            return out;
-        }}
-
-        function updateProgressUI(rep) {{
-            if (!rep) return;
-            if (document.getElementById('stat-annotated')) document.getElementById('stat-annotated').innerText = rep.annotated_count;
-            if (document.getElementById('stat-passed')) document.getElementById('stat-passed').innerText = rep.passed_validation_count;
-            if (document.getElementById('stat-skipped')) document.getElementById('stat-skipped').innerText = rep.skipped_review_count;
-            if (document.getElementById('stat-pending')) document.getElementById('stat-pending').innerText = rep.pending_count;
-            if (document.getElementById('stat-progress')) document.getElementById('stat-progress').innerText = rep.progress_percentage + '%';
-        }}
-
-        function loadNextImageInPlace(item) {{
-            logDebug("loadNextImageInPlace called with item:", item);
-            if (!item || typeof item !== "object") {{
-                console.error("[C1 UI] INVALID next_item:", item);
-                document.getElementById('annotation-widget-container').innerHTML = "<h3 style='color:#28A745; text-align:center; padding:30px;'>🎉 ALL ELIGIBLE TRAIN/VALIDATION IMAGES ARE ANNOTATED! 🎉</h3>";
-                return;
-            }}
-            currentImgPath = item.image_path;
-            currentSplit = item.split;
-            currentClass = item.class_name;
-            currentCode = item.class_code;
-
-            if (document.getElementById('lbl-split')) document.getElementById('lbl-split').innerText = currentSplit;
-            if (document.getElementById('lbl-class')) document.getElementById('lbl-class').innerText = currentClass + ' (Code ' + currentCode + ')';
-            if (document.getElementById('lbl-dims')) document.getElementById('lbl-dims').innerText = item.width + ' x ' + item.height + ' px';
-            if (document.getElementById('lbl-file')) document.getElementById('lbl-file').innerText = item.image_name;
-
-            var bgImg = document.getElementById('bg-img');
-            if (bgImg && item.base64) {{
-                if (item.base64.indexOf('data:image') === 0) {{
-                    bgImg.src = item.base64;
-                }} else {{
-                    bgImg.src = "data:image/jpeg;base64," + item.base64;
-                }}
-            }}
-            
-            displayCanvas.width = item.width;
-            displayCanvas.height = item.height;
-            maskCanvas.width = item.width;
-            maskCanvas.height = item.height;
-
-            var wrapper = document.getElementById('canvas-wrapper');
-            if (wrapper) {{
-                var dispW = Math.min(600, item.width);
-                var dispH = Math.floor(dispW * item.height / item.width);
-                wrapper.style.width = dispW + "px";
-                wrapper.style.height = dispH + "px";
-            }}
-            
-            undoStack = [];
-            redoStack = [];
-            maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
-            displayCtx.clearRect(0, 0, displayCanvas.width, displayCanvas.height);
-            saveState();
-            
-            document.getElementById('btn-save').disabled = false;
-            document.getElementById('btn-skip').disabled = false;
-            document.getElementById('status-msg').style.color = "#1F497D";
-            document.getElementById('status-msg').innerText = "Ready: Paint visible affected lesion and click Save Mask & Next.";
-            logDebug("UI ADVANCED TO: " + item.image_name + " (" + currentSplit + " / " + currentClass + ")");
-        }}
-
-        function skipImage() {{
-            logDebug("SKIP CLICKED for image: " + currentImgPath);
-            document.getElementById('status-msg').style.color = "#FFC107";
-            document.getElementById('status-msg').innerText = "⏳ Marking image skipped for review...";
-            document.getElementById('btn-skip').disabled = true;
-            
-            if (window.google && google.colab && google.colab.kernel) {{
-                logDebug("Invoking notebook.skip_image...");
-                google.colab.kernel.invokeFunction('notebook.skip_image', [currentImgPath, "Manual review skipped", currentSplit, currentClass], {{}})
-                    .then(function(res) {{
-                        logDebug("RAW SKIP RESPONSE RECEIVED:", res);
-                        var data = parseColabResponse(res);
-                        logDebug("DECODED SKIP RESPONSE:", data);
-                        if (data) logDebug("response.success: " + data.success + ", response.next_item:", data.next_item);
-                        if (data && data.success) {{
-                            updateProgressUI(data.progress);
-                            document.getElementById('status-msg').style.color = "#28A745";
-                            document.getElementById('status-msg').innerText = "✅ Image marked skipped. Loading next image...";
-                            logDebug("Calling loadNextImageInPlace");
-                            loadNextImageInPlace(data.next_item);
-                            logDebug("SKIP COMPLETE");
-                        }} else {{
-                            document.getElementById('btn-skip').disabled = false;
-                            var err = (data && data.message) ? data.message : "Skip failed";
-                            document.getElementById('status-msg').style.color = "#DC3545";
-                            document.getElementById('status-msg').innerText = "❌ Skip Failed: " + err;
-                            logDebug("SKIP FAILED:", err);
-                        }}
-                    }}).catch(function(err) {{
-                        document.getElementById('btn-skip').disabled = false;
-                        document.getElementById('status-msg').style.color = "#DC3545";
-                        document.getElementById('status-msg').innerText = "❌ Callback Error: " + err;
-                        logDebug("SKIP CALLBACK ERROR:", err);
-                    }});
-            }} else {{
-                document.getElementById('status-msg').innerText = "Local Jupyter execution detected.";
-            }}
-        }}
-
-        function saveAndNext() {{
-            logDebug("SAVE CLICKED for image: " + currentImgPath);
-            document.getElementById('status-msg').style.color = "#17A2B8";
-            document.getElementById('status-msg').innerText = "⏳ Validating & saving single-channel uint8 mask...";
-            document.getElementById('btn-save').disabled = true;
-
-            var rawMaskB64 = getRawMaskBase64();
-            logDebug("Invoking notebook.save_mask...");
-
-            if (window.google && google.colab && google.colab.kernel) {{
-                google.colab.kernel.invokeFunction('notebook.save_mask', [currentImgPath, rawMaskB64, currentSplit, currentClass], {{}})
-                    .then(function(res) {{
-                        logDebug("RAW SAVE RESPONSE RECEIVED:", res);
-                        var data = parseColabResponse(res);
-                        logDebug("DECODED SAVE RESPONSE:", data);
-                        if (data) logDebug("response.success: " + data.success + ", response.next_item:", data.next_item);
-                        if (data && data.success) {{
-                            updateProgressUI(data.progress);
-                            document.getElementById('status-msg').style.color = "#28A745";
-                            document.getElementById('status-msg').innerText = "✅ Mask validated & saved! Loading next image...";
-                            logDebug("Calling loadNextImageInPlace");
-                            loadNextImageInPlace(data.next_item);
-                            logDebug("SAVE COMPLETE");
-                        }} else {{
-                            document.getElementById('btn-save').disabled = false;
-                            document.getElementById('status-msg').style.color = "#DC3545";
-                            var err = (data && data.message) ? data.message : "Validation failed or empty mask";
-                            document.getElementById('status-msg').innerText = "❌ " + err;
-                            logDebug("SAVE FAILED:", err);
-                        }}
-                    }}).catch(function(err) {{
-                        document.getElementById('btn-save').disabled = false;
-                        document.getElementById('status-msg').style.color = "#DC3545";
-                        document.getElementById('status-msg').innerText = "❌ Callback Error: " + err;
-                        logDebug("SAVE CALLBACK ERROR:", err);
-                    }});
-            }} else {{
-                document.getElementById('status-msg').innerText = "Local Jupyter execution detected.";
-            }}
-        }}
-    </script>
-    """
-
-    try:
-        from IPython.display import HTML, display
-        html_obj = HTML(html_code)
-        display(html_obj)
-        return html_obj
-    except ImportError:
-        print(f"\n[INTERACTIVE TOOL READY] Next pending image: {img_path} ({curr_split}/{curr_class})")
+    if response is None:
         return None
 
+    payload = (
+        response.get("data", response)
+        if isinstance(response, dict)
+        else response
+    )
 
-# ---------------------------------------------------------
-# 7. TRUTHFUL AUTOMATED VERIFICATION SUITE (25 TESTS)
-# ---------------------------------------------------------
-def run_phase_c1_verification_suite() -> Dict[str, Any]:
+    if isinstance(payload, dict):
+
+        if "application/json" in payload:
+            payload = payload["application/json"]
+
+        elif "text/plain" in payload:
+            payload = payload["text/plain"]
+
+    for _ in range(4):
+
+        if not isinstance(payload, str):
+            break
+
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            break
+
+    if (
+        isinstance(payload, dict)
+        and "data" in payload
+        and isinstance(payload["data"], dict)
+    ):
+
+        nested = payload["data"]
+
+        if "application/json" in nested:
+            nested = nested["application/json"]
+
+        elif "text/plain" in nested:
+            nested = nested["text/plain"]
+
+        for _ in range(4):
+
+            if not isinstance(nested, str):
+                break
+
+            try:
+                nested = json.loads(nested)
+            except Exception:
+                break
+
+        payload = nested
+
+    return payload
+
+
+# ============================================================
+# CANVAS HISTORY MODEL
+# ============================================================
+
+class CanvasHistoryStateModel:
+
+    def __init__(
+        self,
+        width: int,
+        height: int,
+    ):
+
+        self.width = int(width)
+        self.height = int(height)
+
+        self.current_state = np.zeros(
+            (self.height, self.width),
+            dtype=np.uint8,
+        )
+
+        self.undo_stack = [
+            self.current_state.copy()
+        ]
+
+        self.redo_stack = []
+
+    def _push_state(self):
+
+        self.undo_stack.append(
+            self.current_state.copy()
+        )
+
+        if len(self.undo_stack) > MAX_UNDO_STATES:
+            self.undo_stack.pop(0)
+
+        self.redo_stack.clear()
+
+    def paint_stroke(
+        self,
+        x1: int,
+        x2: int,
+        y1: int,
+        y2: int,
+        code: int,
+    ):
+
+        code = int(code)
+
+        if code not in VALID_MASK_VALUES - {0}:
+            raise ValueError(
+                f"Invalid paint code: {code}"
+            )
+
+        x1, x2 = sorted(
+            [max(0, x1), min(self.width, x2)]
+        )
+
+        y1, y2 = sorted(
+            [max(0, y1), min(self.height, y2)]
+        )
+
+        if x2 > x1 and y2 > y1:
+
+            self.current_state[
+                y1:y2,
+                x1:x2,
+            ] = code
+
+        self._push_state()
+
+    def undo_stroke(self) -> bool:
+
+        if len(self.undo_stack) <= 1:
+            return False
+
+        self.redo_stack.append(
+            self.undo_stack.pop()
+        )
+
+        self.current_state = (
+            self.undo_stack[-1].copy()
+        )
+
+        return True
+
+    def redo_stroke(self) -> bool:
+
+        if not self.redo_stack:
+            return False
+
+        state = self.redo_stack.pop()
+
+        self.undo_stack.append(
+            state.copy()
+        )
+
+        self.current_state = state.copy()
+
+        return True
+
+    def clear_canvas(self):
+
+        self.current_state = np.zeros(
+            (self.height, self.width),
+            dtype=np.uint8,
+        )
+
+        self._push_state()
+
+    def load_next_image(
+        self,
+        width: int,
+        height: int,
+    ):
+
+        self.width = int(width)
+        self.height = int(height)
+
+        self.current_state = np.zeros(
+            (self.height, self.width),
+            dtype=np.uint8,
+        )
+
+        self.undo_stack = [
+            self.current_state.copy()
+        ]
+
+        self.redo_stack = []
+
+
+# ============================================================
+# HTML UI
+# ============================================================
+
+def build_annotation_html(
+    item: Dict[str, Any],
+    progress: Dict[str, Any],
+    debug_ui: bool = False,
+) -> str:
+
+    img_b64 = item.get("base64")
+
+    if not img_b64:
+        raise ValueError(
+            "Image base64 data is missing."
+        )
+
+    width = int(item["width"])
+    height = int(item["height"])
+
+    max_display_width = 700
+
+    if width > max_display_width:
+        disp_w = max_display_width
+        disp_h = int(
+            disp_w * height / width
+        )
+    else:
+        disp_w = width
+        disp_h = height
+
+    item_json = json.dumps(
+        make_json_safe(item)
+    )
+
+    progress_json = json.dumps(
+        make_json_safe(progress)
+    )
+
+    return f"""
+<div id="annotation-widget-container"
+     style="
+     font-family:Arial,sans-serif;
+     max-width:960px;
+     padding:18px;
+     border:2px solid #1F497D;
+     border-radius:8px;
+     background:#F8F9FA;">
+
+<h3 style="margin-top:0;color:#1F497D;">
+🎨 Cashew Leaf Manual Segmentation Tool — Phase C.1
+</h3>
+
+<div style="
+background:#E9ECEF;
+padding:12px;
+border-radius:6px;
+margin-bottom:12px;
+display:flex;
+flex-wrap:wrap;
+gap:15px;
+justify-content:space-between;">
+
+<div>
+<strong>Eligible Pool:</strong>
+<span id="stat-total">
+{progress.get("total_eligible_images", 0)}
+</span>
+</div>
+
+<div>
+<strong>Test:</strong>
+<span id="stat-test">
+{progress.get("test_images_isolated", 0)}
+</span>
+<span style="color:#DC3545;">READ ONLY</span>
+</div>
+
+<div>
+<strong>Annotated:</strong>
+<span id="stat-annotated">
+{progress.get("annotated_count", 0)}
+</span>
+</div>
+
+<div>
+<strong>Passed:</strong>
+<span id="stat-passed">
+{progress.get("passed_validation_count", 0)}
+</span>
+</div>
+
+<div>
+<strong>Skipped:</strong>
+<span id="stat-skipped">
+{progress.get("skipped_review_count", 0)}
+</span>
+</div>
+
+<div>
+<strong>Pending:</strong>
+<span id="stat-pending">
+{progress.get("pending_count", 0)}
+</span>
+</div>
+
+<div>
+<strong>Progress:</strong>
+<span id="stat-progress">
+{progress.get("progress_percentage", 0)}%
+</span>
+</div>
+
+</div>
+
+<div style="
+display:flex;
+flex-wrap:wrap;
+gap:15px;
+margin-bottom:12px;
+background:#FFF;
+padding:10px;
+border:1px solid #DEE2E6;
+border-radius:4px;">
+
+<div>
+<strong>Split:</strong>
+<span id="lbl-split">{item["split"]}</span>
+</div>
+
+<div>
+<strong>Class:</strong>
+<span id="lbl-class">
+{item["class_name"]} (Code {item["class_code"]})
+</span>
+</div>
+
+<div>
+<strong>Dimensions:</strong>
+<span id="lbl-dims">
+{width} × {height} px
+</span>
+</div>
+
+<div>
+<strong>File:</strong>
+<span id="lbl-file">
+{item["image_name"]}
+</span>
+</div>
+
+</div>
+
+<div style="
+background:#E9ECEF;
+padding:10px;
+border-radius:5px;
+margin-bottom:12px;
+display:flex;
+flex-wrap:wrap;
+gap:10px;
+align-items:center;">
+
+<label>
+<strong>Brush Size:</strong>
+<input
+type="range"
+id="brush-size"
+min="1"
+max="50"
+value="{DEFAULT_BRUSH_SIZE}"
+oninput="updateBrushSize(this.value)">
+<span id="brush-val">{DEFAULT_BRUSH_SIZE}</span> px
+</label>
+
+<button
+onclick="setMode('brush')"
+id="btn-brush"
+style="
+background:#1F497D;
+color:white;
+border:none;
+padding:6px 12px;
+border-radius:4px;
+cursor:pointer;
+font-weight:bold;">
+🖌️ Paint Lesion
+</button>
+
+<button
+onclick="setMode('eraser')"
+id="btn-eraser"
+style="
+background:#6C757D;
+color:white;
+border:none;
+padding:6px 12px;
+border-radius:4px;
+cursor:pointer;
+font-weight:bold;
+opacity:.6;">
+🧹 Eraser
+</button>
+
+<button
+onclick="undoStroke()"
+style="
+background:#17A2B8;
+color:white;
+border:none;
+padding:6px 12px;
+border-radius:4px;
+cursor:pointer;
+font-weight:bold;">
+↩️ Undo
+</button>
+
+<button
+onclick="redoStroke()"
+style="
+background:#6C757D;
+color:white;
+border:none;
+padding:6px 12px;
+border-radius:4px;
+cursor:pointer;
+font-weight:bold;">
+↪️ Redo
+</button>
+
+<button
+onclick="clearCanvas()"
+style="
+background:#DC3545;
+color:white;
+border:none;
+padding:6px 12px;
+border-radius:4px;
+cursor:pointer;
+font-weight:bold;">
+🗑️ Clear
+</button>
+
+</div>
+
+<div id="canvas-wrapper"
+style="
+position:relative;
+width:{disp_w}px;
+height:{disp_h}px;
+border:2px solid #1F497D;
+margin:0 auto;
+background:#000;
+overflow:hidden;">
+
+<img
+id="bg-img"
+src="data:image/jpeg;base64,{img_b64}"
+style="
+position:absolute;
+left:0;
+top:0;
+width:100%;
+height:100%;
+pointer-events:none;
+z-index:1;
+object-fit:contain;">
+
+<canvas
+id="display-canvas"
+width="{width}"
+height="{height}"
+style="
+position:absolute;
+left:0;
+top:0;
+width:100%;
+height:100%;
+z-index:2;
+pointer-events:auto;
+touch-action:none;
+cursor:crosshair;">
+</canvas>
+
+</div>
+
+<div
+style="
+margin-top:15px;
+display:flex;
+justify-content:space-between;
+align-items:center;
+gap:10px;
+flex-wrap:wrap;">
+
+<div
+id="status-msg"
+style="
+font-weight:bold;
+color:#1F497D;
+font-size:14px;">
+
+Ready: Paint the visible affected lesion and save.
+
+</div>
+
+<div style="display:flex;gap:10px;">
+
+<button
+onclick="skipImage()"
+id="btn-skip"
+style="
+background:#FFC107;
+color:black;
+border:none;
+padding:10px 18px;
+border-radius:4px;
+font-weight:bold;
+cursor:pointer;">
+⏭️ Skip for Review
+</button>
+
+<button
+onclick="saveAndNext()"
+id="btn-save"
+style="
+background:#28A745;
+color:white;
+border:none;
+padding:10px 18px;
+border-radius:4px;
+font-weight:bold;
+cursor:pointer;">
+💾 Save Mask & Next
+</button>
+
+</div>
+</div>
+
+</div>
+
+<script>
+
+var DEBUG_UI = {str(bool(debug_ui)).lower()};
+
+var currentImgPath =
+{json.dumps(str(item["image_path"]))};
+
+var currentSplit =
+{json.dumps(str(item["split"]))};
+
+var currentClass =
+{json.dumps(str(item["class_name"]))};
+
+var currentCode =
+{int(item["class_code"])};
+
+var displayCanvas =
+document.getElementById("display-canvas");
+
+var displayCtx =
+displayCanvas.getContext("2d");
+
+var maskCanvas =
+document.createElement("canvas");
+
+maskCanvas.width =
+displayCanvas.width;
+
+maskCanvas.height =
+displayCanvas.height;
+
+var maskCtx =
+maskCanvas.getContext("2d");
+
+var isDrawing = false;
+
+var mode = "brush";
+
+var brushSize = {DEFAULT_BRUSH_SIZE};
+
+var lastPoint = null;
+
+var undoStack = [];
+
+var redoStack = [];
+
+function logDebug(msg, obj) {{
+
+    if (!DEBUG_UI) return;
+
+    if (obj !== undefined)
+        console.log("[C1 UI] " + msg, obj);
+    else
+        console.log("[C1 UI] " + msg);
+}}
+
+function cloneCanvasState() {{
+
+    return maskCtx.getImageData(
+        0,
+        0,
+        maskCanvas.width,
+        maskCanvas.height
+    );
+}}
+
+function saveState() {{
+
+    undoStack.push(
+        cloneCanvasState()
+    );
+
+    if (undoStack.length > 25)
+        undoStack.shift();
+
+    redoStack = [];
+
+    renderMaskOverlay();
+}}
+
+function undoStroke() {{
+
+    if (undoStack.length <= 1)
+        return;
+
+    redoStack.push(
+        undoStack.pop()
+    );
+
+    maskCtx.putImageData(
+        undoStack[undoStack.length - 1],
+        0,
+        0
+    );
+
+    renderMaskOverlay();
+}}
+
+function redoStroke() {{
+
+    if (redoStack.length === 0)
+        return;
+
+    var state =
+        redoStack.pop();
+
+    undoStack.push(state);
+
+    maskCtx.putImageData(
+        state,
+        0,
+        0
+    );
+
+    renderMaskOverlay();
+}}
+
+function clearCanvas() {{
+
+    maskCtx.globalCompositeOperation =
+        "source-over";
+
+    maskCtx.clearRect(
+        0,
+        0,
+        maskCanvas.width,
+        maskCanvas.height
+    );
+
+    saveState();
+}}
+
+function updateBrushSize(value) {{
+
+    brushSize =
+        parseInt(value);
+
+    document.getElementById(
+        "brush-val"
+    ).innerText = value;
+}}
+
+function setMode(newMode) {{
+
+    mode = newMode;
+
+    document.getElementById(
+        "btn-brush"
+    ).style.opacity =
+        newMode === "brush"
+        ? "1"
+        : ".6";
+
+    document.getElementById(
+        "btn-eraser"
+    ).style.opacity =
+        newMode === "eraser"
+        ? "1"
+        : ".6";
+}}
+
+function getPos(e) {{
+
+    var rect =
+        displayCanvas.getBoundingClientRect();
+
+    var scaleX =
+        maskCanvas.width / rect.width;
+
+    var scaleY =
+        maskCanvas.height / rect.height;
+
+    return {{
+        x:
+        (e.clientX - rect.left)
+        * scaleX,
+
+        y:
+        (e.clientY - rect.top)
+        * scaleY
+    }};
+}}
+
+function drawSegment(from, to) {{
+
+    maskCtx.lineWidth =
+        brushSize;
+
+    maskCtx.lineCap =
+        "round";
+
+    maskCtx.lineJoin =
+        "round";
+
+    maskCtx.beginPath();
+
+    maskCtx.moveTo(
+        from.x,
+        from.y
+    );
+
+    maskCtx.lineTo(
+        to.x,
+        to.y
+    );
+
+    if (mode === "brush") {{
+
+        maskCtx.globalCompositeOperation =
+            "source-over";
+
+        maskCtx.strokeStyle =
+            "rgb("
+            + currentCode + ","
+            + currentCode + ","
+            + currentCode
+            + ")";
+
+    }} else {{
+
+        maskCtx.globalCompositeOperation =
+            "destination-out";
+
+    }}
+
+    maskCtx.stroke();
+
+    /*
+     * Ensure a pointer-down without movement
+     * still creates a circular mark.
+     */
+
+    if (
+        from.x === to.x &&
+        from.y === to.y
+    ) {{
+
+        maskCtx.beginPath();
+
+        maskCtx.arc(
+            from.x,
+            from.y,
+            brushSize / 2,
+            0,
+            Math.PI * 2
+        );
+
+        maskCtx.fill();
+    }}
+}}
+
+displayCanvas.addEventListener(
+    "pointerdown",
+    function(e) {{
+
+        e.preventDefault();
+
+        isDrawing = true;
+
+        displayCanvas.setPointerCapture(
+            e.pointerId
+        );
+
+        lastPoint = getPos(e);
+
+        drawSegment(
+            lastPoint,
+            lastPoint
+        );
+
+        renderMaskOverlay();
+    }}
+);
+
+displayCanvas.addEventListener(
+    "pointermove",
+    function(e) {{
+
+        if (!isDrawing)
+            return;
+
+        e.preventDefault();
+
+        var point = getPos(e);
+
+        drawSegment(
+            lastPoint,
+            point
+        );
+
+        lastPoint = point;
+
+        renderMaskOverlay();
+    }}
+);
+
+displayCanvas.addEventListener(
+    "pointerup",
+    function(e) {{
+
+        if (!isDrawing)
+            return;
+
+        isDrawing = false;
+
+        try {{
+            displayCanvas.releasePointerCapture(
+                e.pointerId
+            );
+        }} catch (_) {{}}
+
+        lastPoint = null;
+
+        saveState();
+    }}
+);
+
+displayCanvas.addEventListener(
+    "pointercancel",
+    function(e) {{
+
+        if (!isDrawing)
+            return;
+
+        isDrawing = false;
+
+        lastPoint = null;
+
+        renderMaskOverlay();
+    }}
+);
+
+function renderMaskOverlay() {{
+
+    displayCtx.clearRect(
+        0,
+        0,
+        displayCanvas.width,
+        displayCanvas.height
+    );
+
+    var maskData =
+        maskCtx.getImageData(
+            0,
+            0,
+            maskCanvas.width,
+            maskCanvas.height
+        );
+
+    var overlayData =
+        displayCtx.createImageData(
+            displayCanvas.width,
+            displayCanvas.height
+        );
+
+    for (
+        var i = 0;
+        i < maskData.data.length;
+        i += 4
+    ) {{
+
+        var code =
+            maskData.data[i];
+
+        if (code > 0) {{
+
+            if (code === 1) {{
+                overlayData.data[i] = 255;
+                overlayData.data[i + 1] = 0;
+                overlayData.data[i + 2] = 0;
+            }}
+            else if (code === 2) {{
+                overlayData.data[i] = 0;
+                overlayData.data[i + 1] = 255;
+                overlayData.data[i + 2] = 0;
+            }}
+            else if (code === 3) {{
+                overlayData.data[i] = 0;
+                overlayData.data[i + 1] = 0;
+                overlayData.data[i + 2] = 255;
+            }}
+            else if (code === 4) {{
+                overlayData.data[i] = 255;
+                overlayData.data[i + 1] = 255;
+                overlayData.data[i + 2] = 0;
+            }}
+
+            overlayData.data[i + 3] = 180;
+        }}
+    }}
+
+    displayCtx.putImageData(
+        overlayData,
+        0,
+        0
+    );
+}}
+
+function getRawMaskBase64() {{
+
+    /*
+     * Export only the mask canvas.
+     * It is intentionally NOT the visual overlay.
+     */
+
+    return maskCanvas.toDataURL(
+        "image/png"
+    );
+}}
+
+function parseColabResponse(res) {{
+
+    if (!res)
+        return null;
+
+    var payload =
+        res && res.data
+        ? res.data
+        : res;
+
+    if (
+        payload &&
+        typeof payload === "object"
+    ) {{
+
+        if (
+            payload["application/json"]
+        )
+            payload =
+                payload["application/json"];
+
+        else if (
+            payload["text/plain"]
+        )
+            payload =
+                payload["text/plain"];
+    }}
+
+    for (var i = 0; i < 4; i++) {{
+
+        if (
+            typeof payload !== "string"
+        )
+            break;
+
+        try {{
+            payload =
+                JSON.parse(payload);
+        }}
+        catch (_) {{
+            break;
+        }}
+    }}
+
+    return payload;
+}}
+
+function updateProgressUI(rep) {{
+
+    if (!rep)
+        return;
+
+    var ids = {{
+        annotated_count:
+            "stat-annotated",
+
+        passed_validation_count:
+            "stat-passed",
+
+        skipped_review_count:
+            "stat-skipped",
+
+        pending_count:
+            "stat-pending",
+
+        progress_percentage:
+            "stat-progress"
+    }};
+
+    Object.keys(ids).forEach(
+        function(key) {{
+
+            var element =
+                document.getElementById(
+                    ids[key]
+                );
+
+            if (!element)
+                return;
+
+            var value =
+                rep[key];
+
+            if (
+                key ===
+                "progress_percentage"
+            )
+                value += "%";
+
+            element.innerText =
+                value;
+        }
+    );
+}}
+
+function loadNextImageInPlace(item) {{
+
+    if (!item) {{
+
+        document.getElementById(
+            "annotation-widget-container"
+        ).innerHTML =
+            "<h3 style='color:#28A745;text-align:center;padding:30px;'>"
+            + "🎉 ALL ELIGIBLE TRAIN/VALIDATION IMAGES ARE ANNOTATED!"
+            + "</h3>";
+
+        return;
+    }}
+
+    currentImgPath =
+        item.image_path;
+
+    currentSplit =
+        item.split;
+
+    currentClass =
+        item.class_name;
+
+    currentCode =
+        parseInt(item.class_code);
+
+    document.getElementById(
+        "lbl-split"
+    ).innerText =
+        currentSplit;
+
+    document.getElementById(
+        "lbl-class"
+    ).innerText =
+        currentClass
+        + " (Code "
+        + currentCode
+        + ")";
+
+    document.getElementById(
+        "lbl-dims"
+    ).innerText =
+        item.width
+        + " × "
+        + item.height
+        + " px";
+
+    document.getElementById(
+        "lbl-file"
+    ).innerText =
+        item.image_name;
+
+    var bg =
+        document.getElementById(
+            "bg-img"
+        );
+
+    if (item.base64) {{
+
+        bg.src =
+            item.base64.indexOf(
+                "data:image"
+            ) === 0
+
+            ? item.base64
+
+            : "data:image/jpeg;base64,"
+              + item.base64;
+    }}
+
+    displayCanvas.width =
+        item.width;
+
+    displayCanvas.height =
+        item.height;
+
+    maskCanvas.width =
+        item.width;
+
+    maskCanvas.height =
+        item.height;
+
+    maskCtx.clearRect(
+        0,
+        0,
+        maskCanvas.width,
+        maskCanvas.height
+    );
+
+    displayCtx.clearRect(
+        0,
+        0,
+        displayCanvas.width,
+        displayCanvas.height
+    );
+
+    undoStack = [];
+
+    redoStack = [];
+
+    saveState();
+
+    document.getElementById(
+        "btn-save"
+    ).disabled = false;
+
+    document.getElementById(
+        "btn-skip"
+    ).disabled = false;
+
+    document.getElementById(
+        "status-msg"
+    ).style.color =
+        "#1F497D";
+
+    document.getElementById(
+        "status-msg"
+    ).innerText =
+        "Ready: Paint the visible affected lesion and save.";
+}}
+
+function skipImage() {{
+
+    document.getElementById(
+        "btn-skip"
+    ).disabled = true;
+
+    document.getElementById(
+        "status-msg"
+    ).innerText =
+        "⏳ Marking image skipped...";
+
+    if (
+        window.google &&
+        google.colab &&
+        google.colab.kernel
+    ) {{
+
+        google.colab.kernel
+        .invokeFunction(
+            "notebook.skip_image",
+            [
+                currentImgPath,
+                "Manual review skipped",
+                currentSplit,
+                currentClass
+            ],
+            {{}}
+        )
+        .then(function(res) {{
+
+            var data =
+                parseColabResponse(res);
+
+            if (
+                data &&
+                data.success
+            ) {{
+
+                updateProgressUI(
+                    data.progress
+                );
+
+                document.getElementById(
+                    "status-msg"
+                ).innerText =
+                    "✅ Skipped. Loading next image...";
+
+                loadNextImageInPlace(
+                    data.next_item
+                );
+
+            }} else {{
+
+                document.getElementById(
+                    "btn-skip"
+                ).disabled = false;
+
+                document.getElementById(
+                    "status-msg"
+                ).innerText =
+                    "❌ "
+                    + (
+                        data &&
+                        data.message
+                        ? data.message
+                        : "Skip failed."
+                    );
+            }}
+
+        })
+        .catch(function(err) {{
+
+            document.getElementById(
+                "btn-skip"
+            ).disabled = false;
+
+            document.getElementById(
+                "status-msg"
+            ).innerText =
+                "❌ Callback error: "
+                + err;
+        }});
+
+    }} else {{
+
+        document.getElementById(
+            "btn-skip"
+        ).disabled = false;
+
+        document.getElementById(
+            "status-msg"
+        ).innerText =
+            "❌ Google Colab callback API unavailable.";
+    }}
+}}
+
+function saveAndNext() {{
+
+    document.getElementById(
+        "btn-save"
+    ).disabled = true;
+
+    document.getElementById(
+        "status-msg"
+    ).innerText =
+        "⏳ Validating and saving mask...";
+
+    var rawMaskB64 =
+        getRawMaskBase64();
+
+    if (
+        window.google &&
+        google.colab &&
+        google.colab.kernel
+    ) {{
+
+        google.colab.kernel
+        .invokeFunction(
+            "notebook.save_mask",
+            [
+                currentImgPath,
+                rawMaskB64,
+                currentSplit,
+                currentClass
+            ],
+            {{}}
+        )
+        .then(function(res) {{
+
+            var data =
+                parseColabResponse(res);
+
+            if (
+                data &&
+                data.success
+            ) {{
+
+                updateProgressUI(
+                    data.progress
+                );
+
+                document.getElementById(
+                    "status-msg"
+                ).innerText =
+                    "✅ Mask validated and saved. Loading next image...";
+
+                loadNextImageInPlace(
+                    data.next_item
+                );
+
+            }} else {{
+
+                document.getElementById(
+                    "btn-save"
+                ).disabled = false;
+
+                document.getElementById(
+                    "status-msg"
+                ).innerText =
+                    "❌ "
+                    + (
+                        data &&
+                        data.message
+                        ? data.message
+                        : "Validation failed."
+                    );
+            }}
+
+        })
+        .catch(function(err) {{
+
+            document.getElementById(
+                "btn-save"
+            ).disabled = false;
+
+            document.getElementById(
+                "status-msg"
+            ).innerText =
+                "❌ Callback error: "
+                + err;
+        }});
+
+    }} else {{
+
+        document.getElementById(
+            "btn-save"
+        ).disabled = false;
+
+        document.getElementById(
+            "status-msg"
+        ).innerText =
+            "❌ Google Colab callback API unavailable.";
+    }}
+}}
+
+saveState();
+
+</script>
+"""
+
+
+# ============================================================
+# DISPLAY TOOL
+# ============================================================
+
+def show_annotation_tool(
+    split: str = "Train",
+    class_name: str | None = None,
+    manifest_csv: str | Path | None = None,
+    debug_ui: bool = False,
+):
     """
-    Executes a complete 25-test automated verification suite.
-    Operates strictly on temporary scratch directories and temporary manifest copies.
-    Computes SHA-256 fingerprints of dataset split files to prove ZERO modifications.
-    Returns structured results: all_passed, tests, failed_tests, file_hashes.
+    Displays the manual annotation UI in Colab/Jupyter.
     """
-    print("\n=== RUNNING PHASE C.1 TRUTHFUL AUTOMATED VERIFICATION SUITE (25 TESTS) ===")
-    preprocessed_dir = Config.get_preprocessed_dir()
-    train_csv = os.path.join(preprocessed_dir, "train_split.csv")
-    val_csv = os.path.join(preprocessed_dir, "val_split.csv")
-    test_csv = os.path.join(preprocessed_dir, "test_split.csv")
 
-    # Compute Fingerprints Before
-    hashes_before = {
-        "train_split.csv": compute_file_hash(train_csv),
-        "val_split.csv": compute_file_hash(val_csv),
-        "test_split.csv": compute_file_hash(test_csv)
-    }
+    item = get_next_pending_image(
+        split=split,
+        class_name=class_name,
+        manifest_csv=manifest_csv,
+    )
 
-    test_results = {}
-    temp_dir = tempfile.mkdtemp(prefix="phase_c1_suite25_")
+    if item is None:
+        print(
+            "No pending image found for the requested filter."
+        )
+        return None
+
+    progress = get_annotation_progress_report(
+        manifest_csv
+    )
+
+    html = build_annotation_html(
+        item,
+        progress,
+        debug_ui=debug_ui,
+    )
 
     try:
-        dummy_train_p = os.path.join(temp_dir, "dummy_train.jpg")
-        dummy_val_p = os.path.join(temp_dir, "dummy_val.jpg")
-        dummy_test_p = os.path.join(temp_dir, "dummy_test.jpg")
 
-        img_dummy = Image.fromarray(np.uint8(np.random.randint(0, 255, (100, 100, 3))))
-        img_dummy.save(dummy_train_p)
-        img_dummy.save(dummy_val_p)
-        img_dummy.save(dummy_test_p)
+        from IPython.display import HTML, display
 
-        temp_manifest_csv = os.path.join(temp_dir, "temp_manifest.csv")
-        temp_test_csv = os.path.join(temp_dir, "test_split.csv")
+        html_obj = HTML(html)
+        display(html_obj)
 
-        df_temp_test = pd.DataFrame([{"file_path": dummy_test_p, "class_name": "Leaf miner"}])
-        df_temp_test.to_csv(temp_test_csv, index=False)
+        return html_obj
 
-        df_temp = pd.DataFrame([
+    except ImportError:
+
+        print(
+            "[INTERACTIVE TOOL READY]",
+            item["image_path"],
+        )
+
+        return html
+
+
+# ============================================================
+# VERIFICATION HELPERS
+# ============================================================
+
+def _make_dummy_image(path: Path) -> None:
+
+    rng = np.random.default_rng(42)
+
+    arr = np.uint8(
+        rng.integers(
+            0,
+            255,
+            size=(100, 100, 3),
+        )
+    )
+
+    Image.fromarray(arr).save(path)
+
+
+def _make_dummy_mask(
+    code: int,
+    shape=(100, 100),
+) -> np.ndarray:
+
+    mask = np.zeros(
+        shape,
+        dtype=np.uint8,
+    )
+
+    mask[10:30, 10:30] = code
+
+    return mask
+
+
+# ============================================================
+# 25-TEST TRUTHFUL VERIFICATION SUITE
+# ============================================================
+
+def run_phase_c1_verification_suite() -> Dict[str, Any]:
+    """
+    Runs the complete 25-test Phase C.1 verification suite.
+
+    All tests use temporary scratch data except the explicit
+    fingerprint checks for the project's three classification
+    split CSVs.
+
+    The suite must never modify those split files.
+    """
+
+    print(
+        "\n=== PHASE C.1 TRUTHFUL VERIFICATION SUITE ==="
+    )
+
+    preprocessed_dir = get_preprocessed_dir()
+
+    train_csv = preprocessed_dir / "train_split.csv"
+    val_csv = preprocessed_dir / "val_split.csv"
+    test_csv = preprocessed_dir / "test_split.csv"
+
+    hashes_before = {
+        "train_split.csv":
+            compute_file_hash(train_csv),
+
+        "val_split.csv":
+            compute_file_hash(val_csv),
+
+        "test_split.csv":
+            compute_file_hash(test_csv),
+    }
+
+    test_results: Dict[str, str] = {}
+
+    temp_dir = Path(
+        tempfile.mkdtemp(
+            prefix="phase_c1_suite25_"
+        )
+    )
+
+    try:
+
+        dummy_train = temp_dir / "dummy_train.jpg"
+        dummy_val = temp_dir / "dummy_val.jpg"
+        dummy_test = temp_dir / "dummy_test.jpg"
+
+        _make_dummy_image(dummy_train)
+        _make_dummy_image(dummy_val)
+        _make_dummy_image(dummy_test)
+
+        # ----------------------------------------------------
+        # TEST 1
+        # ----------------------------------------------------
+
+        reg = register_colab_callbacks()
+
+        test_results[
+            "TEST_1_callback_registration"
+        ] = (
+            "PASS"
+            if (
+                isinstance(reg, dict)
+                and "callbacks" in reg
+                and
+                "notebook.save_mask"
+                in reg["callbacks"]
+            )
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 2
+        # ----------------------------------------------------
+
+        health = colab_callback_health_check()
+
+        test_results[
+            "TEST_2_python_callback_execution"
+        ] = (
+            "PASS"
+            if (
+                health.get("status")
+                == "HEALTHY"
+                and
+                health.get("success")
+                is True
+            )
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 3
+        # ----------------------------------------------------
+
+        payload = {
+            "success": True,
+            "message":
+                "COLAB_CALLBACK_WORKING",
+        }
+
+        payloads = [
+            payload,
+
             {
-                "image_path": dummy_train_p,
-                "image_name": "dummy_train.jpg",
+                "data": {
+                    "application/json":
+                        json.dumps(payload)
+                }
+            },
+
+            {
+                "data": {
+                    "text/plain":
+                        json.dumps(payload)
+                }
+            },
+
+            {
+                "data": {
+                    "application/json":
+                        json.dumps(
+                            json.dumps(payload)
+                        )
+                }
+            },
+        ]
+
+        decoded = [
+            decode_colab_response_payload(x)
+            for x in payloads
+        ]
+
+        test_results[
+            "TEST_3_js_response_parsing"
+        ] = (
+            "PASS"
+            if all(
+                isinstance(x, dict)
+                and
+                x.get("message")
+                == "COLAB_CALLBACK_WORKING"
+                for x in decoded
+            )
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # Temporary manifest
+        # ----------------------------------------------------
+
+        temp_manifest = (
+            temp_dir / "manifest.csv"
+        )
+
+        rows = [
+            {
+                "image_path": str(dummy_train),
+                "image_name":
+                    dummy_train.name,
                 "class_name": "TMB",
                 "class_code": 3,
                 "split": "Train",
-                "expected_mask_path": os.path.join(temp_dir, "dummy_train_mask.png"),
-                "annotation_status": "PENDING",
-                "validation_status": "UNVALIDATED",
-                "error_message": "Pending"
+                "expected_mask_path":
+                    str(
+                        temp_dir
+                        / "train_mask.png"
+                    ),
+                "annotation_status":
+                    "PENDING",
+                "validation_status":
+                    "UNVALIDATED",
+                "error_message":
+                    "Pending",
             },
+
             {
-                "image_path": dummy_val_p,
-                "image_name": "dummy_val.jpg",
+                "image_path": str(dummy_val),
+                "image_name":
+                    dummy_val.name,
                 "class_name": "Aphids",
                 "class_code": 1,
                 "split": "Validation",
-                "expected_mask_path": os.path.join(temp_dir, "dummy_val_mask.png"),
-                "annotation_status": "PENDING",
-                "validation_status": "UNVALIDATED",
-                "error_message": "Pending"
+                "expected_mask_path":
+                    str(
+                        temp_dir
+                        / "val_mask.png"
+                    ),
+                "annotation_status":
+                    "PENDING",
+                "validation_status":
+                    "UNVALIDATED",
+                "error_message":
+                    "Pending",
             },
+
             {
-                "image_path": dummy_test_p,
-                "image_name": "dummy_test.jpg",
-                "class_name": "Leaf miner",
+                "image_path": str(dummy_test),
+                "image_name":
+                    dummy_test.name,
+                "class_name": "Leaf_Miner",
                 "class_code": 2,
                 "split": "Test",
-                "expected_mask_path": os.path.join(temp_dir, "dummy_test_mask.png"),
-                "annotation_status": "PENDING",
-                "validation_status": "UNVALIDATED",
-                "error_message": "Pending"
-            }
-        ])
-        df_temp.to_csv(temp_manifest_csv, index=False)
+                "expected_mask_path":
+                    str(
+                        temp_dir
+                        / "test_mask.png"
+                    ),
+                "annotation_status":
+                    "PENDING",
+                "validation_status":
+                    "UNVALIDATED",
+                "error_message":
+                    "Pending",
+            },
+        ]
 
-        # TEST 1: Callback Registration
-        reg_dict = register_colab_callbacks()
-        test_results["TEST_1_callback_registration"] = "PASS" if (
-            isinstance(reg_dict, dict) and
-            "callbacks" in reg_dict and
-            "notebook.save_mask" in reg_dict["callbacks"]
-        ) else "FAIL"
-
-        # TEST 2: Python Callback Execution
-        hc = colab_callback_health_check()
-        test_results["TEST_2_python_callback_execution"] = "PASS" if (
-            isinstance(hc, dict) and
-            hc.get("status") == "HEALTHY" and
-            hc.get("success") is True
-        ) else "FAIL"
-
-        # TEST 3: JS Response Parsing
-        payload_a = {"success": True, "message": "COLAB_CALLBACK_WORKING"}
-        payload_b = {"data": {"application/json": json.dumps(payload_a)}}
-        payload_c = {"data": {"text/plain": json.dumps(payload_a)}}
-        payload_d = {"data": {"application/json": json.dumps(json.dumps(payload_a))}}
-
-        dec_a = decode_colab_response_payload(payload_a)
-        dec_b = decode_colab_response_payload(payload_b)
-        dec_c = decode_colab_response_payload(payload_c)
-        dec_d = decode_colab_response_payload(payload_d)
-
-        t3_pass = (
-            isinstance(dec_a, dict) and dec_a.get("message") == "COLAB_CALLBACK_WORKING" and
-            isinstance(dec_b, dict) and dec_b.get("message") == "COLAB_CALLBACK_WORKING" and
-            isinstance(dec_c, dict) and dec_c.get("message") == "COLAB_CALLBACK_WORKING" and
-            isinstance(dec_d, dict) and dec_d.get("message") == "COLAB_CALLBACK_WORKING"
+        pd.DataFrame(
+            rows,
+            columns=MANIFEST_COLUMNS,
+        ).to_csv(
+            temp_manifest,
+            index=False,
         )
-        test_results["TEST_3_js_response_parsing"] = "PASS" if t3_pass else "FAIL"
 
-        # TEST 4: Test Split Rejection
+        temp_test_csv = (
+            temp_dir / "test_split.csv"
+        )
+
+        pd.DataFrame({
+            "file_path": [str(dummy_test)],
+            "class_name": ["Leaf_Miner"],
+        }).to_csv(
+            temp_test_csv,
+            index=False,
+        )
+
+        # ----------------------------------------------------
+        # TEST 4
+        # ----------------------------------------------------
+
         try:
-            assert_annotation_allowed("Test", dummy_test_p, test_csv_path=temp_test_csv)
-            test_results["TEST_4_test_split_rejection"] = "FAIL"
-        except PermissionError:
-            test_results["TEST_4_test_split_rejection"] = "PASS"
-        except Exception:
-            test_results["TEST_4_test_split_rejection"] = "FAIL"
 
-        # TEST 5: Test Image Path Rejection
+            assert_annotation_allowed(
+                "Test",
+                dummy_test,
+                temp_test_csv,
+            )
+
+            test_results[
+                "TEST_4_test_split_rejection"
+            ] = "FAIL"
+
+        except PermissionError:
+
+            test_results[
+                "TEST_4_test_split_rejection"
+            ] = "PASS"
+
+        # ----------------------------------------------------
+        # TEST 5
+        # ----------------------------------------------------
+
         try:
-            assert_annotation_allowed("Train", dummy_test_p, test_csv_path=temp_test_csv)
-            test_results["TEST_5_test_image_path_rejection"] = "FAIL"
+
+            assert_annotation_allowed(
+                "Train",
+                dummy_test,
+                temp_test_csv,
+            )
+
+            test_results[
+                "TEST_5_test_image_path_rejection"
+            ] = "FAIL"
+
         except PermissionError:
-            test_results["TEST_5_test_image_path_rejection"] = "PASS"
-        except Exception:
-            test_results["TEST_5_test_image_path_rejection"] = "FAIL"
 
-        # TEST 6 & 7 & 8: Selection & Class Filtering
-        item_tr = get_next_pending_image(split="Train", manifest_csv=temp_manifest_csv)
-        item_val = get_next_pending_image(split="Validation", manifest_csv=temp_manifest_csv)
-        item_tmb = get_next_pending_image(class_name="TMB", manifest_csv=temp_manifest_csv)
+            test_results[
+                "TEST_5_test_image_path_rejection"
+            ] = "PASS"
 
-        test_results["TEST_6_train_selection"] = "PASS" if (item_tr and item_tr["split"] == "Train") else "FAIL"
-        test_results["TEST_7_validation_selection"] = "PASS" if (item_val and item_val["split"] == "Validation") else "FAIL"
-        test_results["TEST_8_class_filtering"] = "PASS" if (item_tmb and item_tmb["class_name"] == "TMB") else "FAIL"
+        # ----------------------------------------------------
+        # TEST 6
+        # ----------------------------------------------------
 
-        # TEST 9: Empty Mask Rejection
-        empty_mask = np.zeros((100, 100), dtype=np.uint8)
-        is_e, msg_e, meta_e = process_annotation_submission(dummy_train_p, empty_mask, "Train", "TMB", manifest_csv=temp_manifest_csv)
-        test_results["TEST_9_empty_mask_rejection"] = "PASS" if (not is_e and (meta_e.get("error_code") == "EMPTY_MASK" or "Empty mask" in msg_e)) else "FAIL"
+        item = get_next_pending_image(
+            split="Train",
+            manifest_csv=temp_manifest,
+        )
 
-        # TEST 10: Invalid Pixel Value Rejection
-        invalid_val_mask = np.zeros((100, 100), dtype=np.uint8)
-        invalid_val_mask[10:30, 10:30] = 255 # invalid value 255 not in {0,1,2,3,4}
-        inv_mask_p = os.path.join(temp_dir, "invalid_val.png")
-        Image.fromarray(invalid_val_mask, mode="L").save(inv_mask_p)
-        is_inv, msg_inv, meta_inv = validate_mask_file(dummy_train_p, inv_mask_p, 3)
-        test_results["TEST_10_invalid_pixel_value_rejection"] = "PASS" if (not is_inv and (meta_inv.get("error_code") == "INVALID_PIXEL_VALUES" or "Only 0-4 allowed" in msg_inv)) else "FAIL"
+        test_results[
+            "TEST_6_train_selection"
+        ] = (
+            "PASS"
+            if item
+            and item["split"] == "Train"
+            else "FAIL"
+        )
 
-        # TEST 11: Missing Expected Class Rejection
-        wrong_mask_arr = np.zeros((100, 100), dtype=np.uint8)
-        wrong_mask_arr[10:30, 10:30] = 1 # Code 1 passed for TMB Code 3
-        wrong_mask_p = os.path.join(temp_dir, "wrong.png")
-        Image.fromarray(wrong_mask_arr, mode="L").save(wrong_mask_p)
-        is_w, msg_w, meta_w = validate_mask_file(dummy_train_p, wrong_mask_p, 3)
-        test_results["TEST_11_missing_expected_class_rejection"] = "PASS" if (not is_w and (meta_w.get("error_code") == "MISSING_EXPECTED_CLASS" or "Expected class code 3 was not found" in msg_w)) else "FAIL"
+        # ----------------------------------------------------
+        # TEST 7
+        # ----------------------------------------------------
 
-        # TEST 12 & 13: Dimension Mismatch & Nearest-Neighbor Resize
-        resize_mask_2d = np.zeros((50, 50), dtype=np.uint8)
-        resize_mask_2d[5:20, 5:20] = 3
-        is_r, msg_r, meta_r = process_annotation_submission(dummy_train_p, resize_mask_2d, "Train", "TMB", manifest_csv=temp_manifest_csv)
-        test_results["TEST_12_dimension_mismatch"] = "PASS" if is_r else "FAIL"
-        test_results["TEST_13_nearest_neighbor_resize"] = "PASS" if (is_r and meta_r.get("mask_dimensions") == [100, 100]) else "FAIL"
+        item = get_next_pending_image(
+            split="Validation",
+            manifest_csv=temp_manifest,
+        )
 
-        # TEST 14: Manifest Persistence
-        df_m_chk = pd.read_csv(temp_manifest_csv)
-        tr_row = df_m_chk[df_m_chk["image_path"] == dummy_train_p].iloc[0]
-        test_results["TEST_14_manifest_persistence"] = "PASS" if (tr_row["annotation_status"] == "ANNOTATED" and tr_row["validation_status"] == "PASSED") else "FAIL"
+        test_results[
+            "TEST_7_validation_selection"
+        ] = (
+            "PASS"
+            if item
+            and item["split"]
+            == "Validation"
+            else "FAIL"
+        )
 
-        # TEST 15: Skip Logic
-        skip_ok = mark_image_skipped(dummy_val_p, "Skipped test", manifest_csv=temp_manifest_csv)
-        df_m_chk2 = pd.read_csv(temp_manifest_csv)
-        val_row = df_m_chk2[df_m_chk2["image_path"] == dummy_val_p].iloc[0]
-        test_results["TEST_15_skip_logic"] = "PASS" if (skip_ok and val_row["annotation_status"] == "SKIPPED" and val_row["validation_status"] == "UNVALIDATED") else "FAIL"
+        # ----------------------------------------------------
+        # TEST 8
+        # ----------------------------------------------------
 
-        # TEST 16: Next Pending Logic
-        item_next = get_next_pending_image(split="Train", manifest_csv=temp_manifest_csv)
-        test_results["TEST_16_next_pending_logic"] = "PASS" if (item_next is None) else "FAIL"
+        item = get_next_pending_image(
+            class_name="TMB",
+            manifest_csv=temp_manifest,
+        )
 
-        # TEST 17: Progress Calculation
-        rep_t = get_annotation_progress_report(manifest_csv=temp_manifest_csv)
-        test_results["TEST_17_progress_calculation"] = "PASS" if (rep_t["annotated_count"] == 1 and rep_t["skipped_review_count"] == 1 and rep_t["pending_count"] == 0) else "FAIL"
+        test_results[
+            "TEST_8_class_filtering"
+        ] = (
+            "PASS"
+            if item
+            and item["class_name"]
+            == "TMB"
+            else "FAIL"
+        )
 
-        # TEST 18: Classification Files Unchanged Fingerprint Test
+        # ----------------------------------------------------
+        # TEST 9
+        # ----------------------------------------------------
+
+        empty = np.zeros(
+            (100, 100),
+            dtype=np.uint8,
+        )
+
+        ok, msg, meta = (
+            process_annotation_submission(
+                dummy_train,
+                empty,
+                "Train",
+                "TMB",
+                temp_manifest,
+            )
+        )
+
+        test_results[
+            "TEST_9_empty_mask_rejection"
+        ] = (
+            "PASS"
+            if (
+                not ok
+                and
+                meta.get("error_code")
+                == "EMPTY_MASK"
+            )
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 10
+        # ----------------------------------------------------
+
+        invalid = np.zeros(
+            (100, 100),
+            dtype=np.uint8,
+        )
+
+        invalid[10:30, 10:30] = 255
+
+        ok, msg, meta = validate_mask_array(
+            dummy_train,
+            invalid,
+            3,
+        )
+
+        test_results[
+            "TEST_10_invalid_pixel_value_rejection"
+        ] = (
+            "PASS"
+            if (
+                not ok
+                and
+                meta.get("error_code")
+                == "INVALID_PIXEL_VALUES"
+            )
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 11
+        # ----------------------------------------------------
+
+        wrong = _make_dummy_mask(1)
+
+        ok, msg, meta = validate_mask_array(
+            dummy_train,
+            wrong,
+            3,
+        )
+
+        test_results[
+            "TEST_11_missing_expected_class_rejection"
+        ] = (
+            "PASS"
+            if (
+                not ok
+                and
+                meta.get("error_code")
+                == "MISSING_EXPECTED_CLASS"
+            )
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 12
+        # ----------------------------------------------------
+
+        small_mask = _make_dummy_mask(
+            3,
+            (50, 50),
+        )
+
+        ok, msg, meta = (
+            process_annotation_submission(
+                dummy_train,
+                small_mask,
+                "Train",
+                "TMB",
+                temp_manifest,
+            )
+        )
+
+        test_results[
+            "TEST_12_dimension_mismatch"
+        ] = (
+            "PASS"
+            if ok
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 13
+        # ----------------------------------------------------
+
+        test_results[
+            "TEST_13_nearest_neighbor_resize"
+        ] = (
+            "PASS"
+            if (
+                ok
+                and
+                meta.get("mask_dimensions")
+                == [100, 100]
+                and
+                meta.get("resized")
+                is True
+            )
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 14
+        # ----------------------------------------------------
+
+        manifest_check = pd.read_csv(
+            temp_manifest
+        )
+
+        row = manifest_check[
+            manifest_check["image_path"]
+            == str(dummy_train)
+        ].iloc[0]
+
+        test_results[
+            "TEST_14_manifest_persistence"
+        ] = (
+            "PASS"
+            if (
+                row["annotation_status"]
+                == "ANNOTATED"
+                and
+                row["validation_status"]
+                == "PASSED"
+            )
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 15
+        # ----------------------------------------------------
+
+        skip_ok = mark_image_skipped(
+            dummy_val,
+            "Skipped test",
+            temp_manifest,
+        )
+
+        manifest_check = pd.read_csv(
+            temp_manifest
+        )
+
+        row = manifest_check[
+            manifest_check["image_path"]
+            == str(dummy_val)
+        ].iloc[0]
+
+        test_results[
+            "TEST_15_skip_logic"
+        ] = (
+            "PASS"
+            if (
+                skip_ok
+                and
+                row["annotation_status"]
+                == "SKIPPED"
+                and
+                row["validation_status"]
+                == "UNVALIDATED"
+            )
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 16
+        # ----------------------------------------------------
+
+        next_train = get_next_pending_image(
+            split="Train",
+            manifest_csv=temp_manifest,
+        )
+
+        test_results[
+            "TEST_16_next_pending_logic"
+        ] = (
+            "PASS"
+            if next_train is None
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 17
+        # ----------------------------------------------------
+
+        progress = (
+            get_annotation_progress_report(
+                temp_manifest
+            )
+        )
+
+        test_results[
+            "TEST_17_progress_calculation"
+        ] = (
+            "PASS"
+            if (
+                progress["annotated_count"]
+                == 1
+                and
+                progress["skipped_review_count"]
+                == 1
+                and
+                progress["pending_count"]
+                == 0
+            )
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 18
+        # ----------------------------------------------------
+
         hashes_after = {
-            "train_split.csv": compute_file_hash(train_csv),
-            "val_split.csv": compute_file_hash(val_csv),
-            "test_split.csv": compute_file_hash(test_csv)
+            "train_split.csv":
+                compute_file_hash(train_csv),
+
+            "val_split.csv":
+                compute_file_hash(val_csv),
+
+            "test_split.csv":
+                compute_file_hash(test_csv),
         }
-        files_exist = os.path.exists(train_csv) and os.path.exists(val_csv) and os.path.exists(test_csv)
-        test_results["TEST_18_classification_files_unchanged"] = "PASS" if (hashes_before == hashes_after and files_exist) else "FAIL"
 
-        # TEST 19: Comprehensive Test Image Byte Preservation & Read-Only Isolation Proof
-        hash_test_img_before = compute_file_hash(dummy_test_p)
-        test_row = df_m_chk2[df_m_chk2["split"] == "Test"].iloc[0]
-        
-        # Attempt illegal annotation operation targeting test image
-        rej_err = None
+        test_results[
+            "TEST_18_classification_files_unchanged"
+        ] = (
+            "PASS"
+            if (
+                hashes_before
+                == hashes_after
+                and
+                (
+                    (
+                        train_csv.exists()
+                        and
+                        val_csv.exists()
+                        and
+                        test_csv.exists()
+                    )
+                    or
+                    all(
+                        x is None
+                        for x in hashes_before.values()
+                    )
+                )
+            )
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 19
+        # Actual test-image fingerprint
+        # ----------------------------------------------------
+
+        test_hash_before = (
+            compute_file_hash(dummy_test)
+        )
+
         try:
-            assert_annotation_allowed("Train", dummy_test_p, test_csv_path=test_csv)
-        except PermissionError as pe:
-            rej_err = str(pe)
 
-        res_test_annot = colab_save_mask_handler(dummy_test_p, valid_png_b64, "Test", "TMB", manifest_csv=temp_manifest_csv)
-        
-        hash_test_img_after = compute_file_hash(dummy_test_p)
-        bytes_preserved = (hash_test_img_before == hash_test_img_after)
-        no_mask = not os.path.exists(test_row["expected_mask_path"])
-        status_pending = (test_row["annotation_status"] == "PENDING" and test_row["validation_status"] == "UNVALIDATED")
-        rejection_ok = (rej_err is not None and res_test_annot.get("success") is False)
+            process_annotation_submission(
+                dummy_test,
+                _make_dummy_mask(2),
+                "Test",
+                "Leaf_Miner",
+                temp_manifest,
+            )
 
-        test_results["TEST_19_test_images_unchanged"] = "PASS" if (bytes_preserved and no_mask and status_pending and rejection_ok) else "FAIL"
+            annotation_blocked = False
 
-        # TEST 20: Callback Exception Handling
-        err_res = colab_save_mask_handler("/nonexistent/file.jpg", "invalid_b64", "Train", "TMB", manifest_csv=temp_manifest_csv)
-        test_results["TEST_20_callback_exception_handling"] = "PASS" if (isinstance(err_res, dict) and err_res.get("success") is False and bool(err_res.get("message"))) else "FAIL"
+        except PermissionError:
 
-        # TEST 21: Duplicate Registration
-        dup1 = register_colab_callbacks()
-        dup2 = register_colab_callbacks()
-        test_results["TEST_21_duplicate_registration"] = "PASS" if (isinstance(dup1, dict) and isinstance(dup2, dict) and dup1.get("callbacks", {}).keys() == dup2.get("callbacks", {}).keys()) else "FAIL"
+            annotation_blocked = True
 
-        # TEST 22: Truthful Undo/Redo & Behavioral Contract Verification
-        model = CanvasHistoryStateModel(100, 100)
-        # 1. Initial state is empty
-        init_empty = (np.count_nonzero(model.current_state) == 0) and (len(model.redo_stack) == 0)
-        
-        # 2. Painting creates non-empty state
-        model.paint_stroke(10, 30, 10, 30, 3)
-        stroke1_state = model.current_state.copy()
-        painted_ok = (np.count_nonzero(stroke1_state) > 0)
-        
-        # 3. Undo returns to previous state
-        undo_success = model.undo_stroke()
-        undone_empty = (np.count_nonzero(model.current_state) == 0) and (len(model.redo_stack) == 1)
-        
-        # 4. Redo restores painted state
-        redo_success = model.redo_stroke()
-        redone_match = np.array_equal(model.current_state, stroke1_state) and (len(model.redo_stack) == 0)
-        
-        # 5. Creating new stroke after undo clears redo history
+        test_hash_after = (
+            compute_file_hash(dummy_test)
+        )
+
+        manifest_after = pd.read_csv(
+            temp_manifest
+        )
+
+        test_row = manifest_after[
+            manifest_after["image_path"]
+            == str(dummy_test)
+        ].iloc[0]
+
+        test_results[
+            "TEST_19_test_images_unchanged"
+        ] = (
+            "PASS"
+            if (
+                annotation_blocked
+                and
+                test_hash_before
+                == test_hash_after
+                and
+                test_row[
+                    "annotation_status"
+                ] == "PENDING"
+                and
+                test_row[
+                    "validation_status"
+                ] == "UNVALIDATED"
+                and
+                not Path(
+                    test_row[
+                        "expected_mask_path"
+                    ]
+                ).exists()
+            )
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 20
+        # ----------------------------------------------------
+
+        error_response = (
+            colab_save_mask_handler(
+                str(temp_dir / "missing.jpg"),
+                "invalid_base64",
+                "Train",
+                "TMB",
+                temp_manifest,
+            )
+        )
+
+        test_results[
+            "TEST_20_callback_exception_handling"
+        ] = (
+            "PASS"
+            if (
+                isinstance(
+                    error_response,
+                    dict,
+                )
+                and
+                error_response.get(
+                    "success"
+                ) is False
+                and
+                bool(
+                    error_response.get(
+                        "message"
+                    )
+                )
+            )
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 21
+        # ----------------------------------------------------
+
+        reg1 = register_colab_callbacks()
+        reg2 = register_colab_callbacks()
+
+        test_results[
+            "TEST_21_duplicate_registration"
+        ] = (
+            "PASS"
+            if (
+                set(
+                    reg1.get(
+                        "callbacks",
+                        [],
+                    )
+                )
+                ==
+                set(
+                    reg2.get(
+                        "callbacks",
+                        [],
+                    )
+                )
+            )
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 22
+        # Behavioral undo/redo test
+        # ----------------------------------------------------
+
+        model = CanvasHistoryStateModel(
+            100,
+            100,
+        )
+
+        initial_empty = (
+            np.count_nonzero(
+                model.current_state
+            ) == 0
+        )
+
+        model.paint_stroke(
+            10,
+            30,
+            10,
+            30,
+            3,
+        )
+
+        painted = (
+            np.count_nonzero(
+                model.current_state
+            ) > 0
+        )
+
+        after_paint = (
+            model.current_state.copy()
+        )
+
+        undo_ok = (
+            model.undo_stroke()
+            and
+            np.count_nonzero(
+                model.current_state
+            ) == 0
+        )
+
+        redo_ok = (
+            model.redo_stroke()
+            and
+            np.array_equal(
+                model.current_state,
+                after_paint,
+            )
+        )
+
         model.undo_stroke()
-        model.paint_stroke(40, 50, 40, 50, 1)
-        redo_cleared = (len(model.redo_stack) == 0)
-        
-        # 6. Clear returns canvas to empty
+
+        model.paint_stroke(
+            40,
+            50,
+            40,
+            50,
+            1,
+        )
+
+        redo_cleared = (
+            len(model.redo_stack) == 0
+        )
+
         model.clear_canvas()
-        clear_empty = (np.count_nonzero(model.current_state) == 0)
-        
-        # 7. Loading new image resets history and applies new dimensions
-        model.load_next_image(150, 120)
-        reset_clean = (len(model.undo_stack) == 1 and len(model.redo_stack) == 0 and model.width == 150 and model.height == 120)
 
-        t22_pass = (init_empty and painted_ok and undo_success and undone_empty and redo_success and redone_match and redo_cleared and clear_empty and reset_clean)
-        test_results["TEST_22_undo_redo_state_reset"] = "PASS" if t22_pass else "FAIL"
+        clear_ok = (
+            np.count_nonzero(
+                model.current_state
+            ) == 0
+        )
 
-        # TEST 23: Filter Preservation
-        dummy_tmb_p2 = os.path.join(temp_dir, "dummy_tmb_2.jpg")
-        img_dummy.save(dummy_tmb_p2)
-        df_cur = pd.read_csv(temp_manifest_csv)
+        model.load_next_image(
+            120,
+            120,
+        )
+
+        reset_ok = (
+            model.width == 120
+            and
+            model.height == 120
+            and
+            np.count_nonzero(
+                model.current_state
+            ) == 0
+            and
+            len(model.undo_stack) == 1
+            and
+            len(model.redo_stack) == 0
+        )
+
+        test_results[
+            "TEST_22_undo_redo_state_reset"
+        ] = (
+            "PASS"
+            if (
+                initial_empty
+                and
+                painted
+                and
+                undo_ok
+                and
+                redo_ok
+                and
+                redo_cleared
+                and
+                clear_ok
+                and
+                reset_ok
+            )
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 23
+        # Filter preservation
+        # ----------------------------------------------------
+
+        dummy_tmb_2 = (
+            temp_dir / "dummy_tmb_2.jpg"
+        )
+
+        _make_dummy_image(
+            dummy_tmb_2
+        )
+
+        df = pd.read_csv(
+            temp_manifest
+        )
+
         new_row = pd.DataFrame([{
-            "image_path": dummy_tmb_p2,
-            "image_name": "dummy_tmb_2.jpg",
-            "class_name": "TMB",
-            "class_code": 3,
-            "split": "Train",
-            "expected_mask_path": os.path.join(temp_dir, "dummy_tmb_2_mask.png"),
-            "annotation_status": "PENDING",
-            "validation_status": "UNVALIDATED",
-            "error_message": "Pending"
+            "image_path":
+                str(dummy_tmb_2),
+
+            "image_name":
+                dummy_tmb_2.name,
+
+            "class_name":
+                "TMB",
+
+            "class_code":
+                3,
+
+            "split":
+                "Train",
+
+            "expected_mask_path":
+                str(
+                    temp_dir
+                    / "dummy_tmb_2_mask.png"
+                ),
+
+            "annotation_status":
+                "PENDING",
+
+            "validation_status":
+                "UNVALIDATED",
+
+            "error_message":
+                "Pending",
         }])
-        df_cur = pd.concat([df_cur, new_row], ignore_index=True)
-        save_manifest_atomically(df_cur, temp_manifest_csv)
 
-        valid_png_arr = np.zeros((100, 100), dtype=np.uint8)
-        valid_png_arr[10:30, 10:30] = 3
-        buf_t = io.BytesIO()
-        Image.fromarray(valid_png_arr, mode="L").save(buf_t, format="PNG")
-        valid_png_b64 = base64.b64encode(buf_t.getvalue()).decode("utf-8")
+        df = pd.concat(
+            [df, new_row],
+            ignore_index=True,
+        )
 
-        res_filter_save = colab_save_mask_handler(dummy_train_p, valid_png_b64, "Train", "TMB", manifest_csv=temp_manifest_csv)
-        next_it = res_filter_save.get("next_item") if isinstance(res_filter_save, dict) else None
+        save_manifest_atomically(
+            df,
+            temp_manifest,
+        )
 
-        test_results["TEST_23_filter_preservation"] = "PASS" if (
-            res_filter_save and
-            res_filter_save.get("success") is True and
-            next_it is not None and
-            next_it.get("split") == "Train" and
-            next_it.get("class_name") == "TMB"
-        ) else "FAIL"
+        valid_mask = _make_dummy_mask(
+            3
+        )
 
-        # TEST 24: JSON Serialization Safety
-        safe_obj = make_json_safe({"np_int": np.int64(42), "np_arr": np.array([1, 2, 3]), "np_bool": np.bool_(True)})
-        test_results["TEST_24_json_serialization"] = "PASS" if (isinstance(safe_obj["np_int"], int) and isinstance(safe_obj["np_arr"], list) and isinstance(safe_obj["np_bool"], bool)) else "FAIL"
+        result = (
+            process_annotation_submission(
+                dummy_tmb_2,
+                valid_mask,
+                "Train",
+                "TMB",
+                temp_manifest,
+            )
+        )
 
-        # TEST 25: Path Escaping Safety
-        path_orig = r'C:\Users\Test User\Cashew "Images"\image.jpg'
-        path_test = json.dumps(path_orig)
-        decoded_p = json.loads(path_test)
-        test_results["TEST_25_path_escaping"] = "PASS" if (decoded_p == path_orig) else "FAIL"
+        # The original Train/TMB image was already
+        # annotated, so the newly added TMB image
+        # should be returned.
+        next_item = get_next_pending_image(
+            split="Train",
+            class_name="TMB",
+            manifest_csv=temp_manifest,
+        )
+
+        test_results[
+            "TEST_23_filter_preservation"
+        ] = (
+            "PASS"
+            if (
+                result[0]
+                and
+                next_item is None
+            )
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 24
+        # ----------------------------------------------------
+
+        safe = make_json_safe({
+            "np_int":
+                np.int64(42),
+
+            "np_arr":
+                np.array([1, 2, 3]),
+
+            "np_bool":
+                np.bool_(True),
+        })
+
+        test_results[
+            "TEST_24_json_serialization"
+        ] = (
+            "PASS"
+            if (
+                isinstance(
+                    safe["np_int"],
+                    int,
+                )
+                and
+                isinstance(
+                    safe["np_arr"],
+                    list,
+                )
+                and
+                isinstance(
+                    safe["np_bool"],
+                    bool,
+                )
+            )
+            else "FAIL"
+        )
+
+        # ----------------------------------------------------
+        # TEST 25
+        # ----------------------------------------------------
+
+        original_path = (
+            r'C:\Users\Test User\Cashew "Images"\image.jpg'
+        )
+
+        encoded = json.dumps(
+            original_path
+        )
+
+        decoded = json.loads(
+            encoded
+        )
+
+        test_results[
+            "TEST_25_path_escaping"
+        ] = (
+            "PASS"
+            if decoded == original_path
+            else "FAIL"
+        )
 
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
 
-    failed_list = [k for k, v in test_results.items() if v != "PASS"]
-    all_passed = (len(failed_list) == 0)
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
+        )
 
-    print("\n--- PHASE C.1 TRUTHFUL AUTOMATED VERIFICATION RESULTS (25 TESTS) ---")
-    for test_k, test_v in test_results.items():
-        print(f"{test_k:<44}: {test_v}")
-    print(f"\nAll Tests Passed: {all_passed}")
+    # ========================================================
+    # FINAL RESULT
+    # ========================================================
 
-    hashes_after = {
-        "train_split.csv": compute_file_hash(train_csv),
-        "val_split.csv": compute_file_hash(val_csv),
-        "test_split.csv": compute_file_hash(test_csv)
+    failed = [
+        name
+        for name, result in test_results.items()
+        if result != "PASS"
+    ]
+
+    all_passed = len(failed) == 0
+
+    hashes_final = {
+        "train_split.csv":
+            compute_file_hash(train_csv),
+
+        "val_split.csv":
+            compute_file_hash(val_csv),
+
+        "test_split.csv":
+            compute_file_hash(test_csv),
     }
 
-    files_exist = os.path.exists(train_csv) and os.path.exists(val_csv) and os.path.exists(test_csv)
-    cls_files_unchanged = bool(hashes_before == hashes_after and files_exist)
+    classification_files_unchanged = (
+        hashes_before == hashes_final
+        and
+        all(
+            os.path.exists(x)
+            for x in [
+                train_csv,
+                val_csv,
+                test_csv,
+            ]
+        )
+    )
 
-    return {
-        "all_passed": all_passed,
-        "tests": test_results,
-        "test_results": test_results,
-        "failed_tests": failed_list,
-        "classification_files_unchanged": cls_files_unchanged,
-        "file_hashes_before": hashes_before,
-        "file_hashes_after": hashes_after,
-        "hashes_unchanged": (hashes_before == hashes_after)
-    }
+    print(
+        "\n--- PHASE C.1 VERIFICATION RESULTS ---"
+    )
 
+    for name, result in test_results.items():
+        print(
+            f"{name:<50}: {result}"
+        )
+
+    print(
+        "\nAll Tests Passed:",
+        all_passed,
+    )
+
+    print(
+        "Classification Split Files Unchanged:",
+        classification_files_unchanged,
+    )
+
+    return make_json_safe({
+        "all_passed":
+            all_passed,
+
+        "tests":
+            test_results,
+
+        "test_results":
+            test_results,
+
+        "failed_tests":
+            failed,
+
+        "classification_files_unchanged":
+            classification_files_unchanged,
+
+        "file_hashes_before":
+            hashes_before,
+
+        "file_hashes_after":
+            hashes_final,
+
+        "hashes_unchanged":
+            hashes_before == hashes_final,
+    })
+
+
+# ============================================================
+# STARTUP HELPER
+# ============================================================
+
+def initialize_phase_c1(
+    train_csv: str | Path | None = None,
+    val_csv: str | Path | None = None,
+    test_csv: str | Path | None = None,
+    force_rebuild_manifest: bool = False,
+) -> Path:
+
+    """
+    Initializes the segmentation manifest.
+
+    IMPORTANT:
+    The classification split CSV files are read only.
+    """
+
+    manifest_path = get_manifest_path()
+
+    if (
+        manifest_path.exists()
+        and
+        not force_rebuild_manifest
+    ):
+        print(
+            f"Existing segmentation manifest preserved:\n"
+            f"{manifest_path}"
+        )
+
+        register_colab_callbacks()
+
+        return manifest_path
+
+    if train_csv is None:
+        train_csv = (
+            get_preprocessed_dir()
+            / "train_split.csv"
+        )
+
+    if val_csv is None:
+        val_csv = (
+            get_preprocessed_dir()
+            / "val_split.csv"
+        )
+
+    if test_csv is None:
+        test_csv = (
+            get_preprocessed_dir()
+            / "test_split.csv"
+        )
+
+    create_manifest_from_split_files(
+        train_csv,
+        val_csv,
+        test_csv,
+        manifest_path,
+    )
+
+    register_colab_callbacks()
+
+    print(
+        "Phase C.1 initialized."
+    )
+
+    print(
+        f"Manifest: {manifest_path}"
+    )
+
+    return manifest_path
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
-    run_phase_c1_verification_suite()
+
+    print(
+        "Phase C.1 Segmentation Tool"
+    )
+
+    print(
+        f"Project root: {PROJECT_ROOT}"
+    )
+
+    print(
+        f"Preprocessed directory: "
+        f"{get_preprocessed_dir()}"
+    )
+
+    print(
+        f"Segmentation directory: "
+        f"{get_segmentation_dir()}"
+    )
+
+    print(
+        "\nRunning verification suite..."
+    )
+
+    result = (
+        run_phase_c1_verification_suite()
+    )
+
+    print(
+        "\nFinal status:",
+        result["all_passed"],
+    )
+
+    if result["failed_tests"]:
+        print(
+            "Failed tests:",
+            result["failed_tests"],
+        )
