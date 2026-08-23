@@ -540,19 +540,24 @@ def audit_segmentation_dataset() -> Dict:
                 if any(kw in f_lower for kw in ["mask", "_seg", "polygon", "labelme"]):
                     discovered_mask_files.append(os.path.join(root, file))
 
-    annotated_cnt = int((df_manifest["annotation_status"] == "ANNOTATED").sum())
-    passed_cnt = int((df_manifest["validation_status"] == "PASSED").sum())
+    manual_annotated_cnt = int((df_manifest["annotation_status"] == "ANNOTATED").sum())
+    manual_passed_cnt = int((df_manifest["validation_status"] == "PASSED").sum())
     total_images = len(df_manifest)
 
-    # Strictly set status to GROUND_TRUTH_MASKS_NOT_FOUND when valid ground-truth masks are zero
-    if passed_cnt > 0:
+    # External pre-existing dataset ground-truth availability is determined ONLY by external discovered mask count.
+    # Manual annotation workspace progress (Experiments/Segmentation/Annotations/) MUST NOT determine external dataset audit status.
+    external_valid_masks = len(discovered_mask_files)
+
+    if external_valid_masks > 0:
         audit_status = "GROUND_TRUTH_MASKS_AVAILABLE"
         seg_possible = True
-        audit_wording = f"Discovered {passed_cnt} valid ground-truth segmentation masks."
+        audit_wording = f"Discovered {external_valid_masks} valid external ground-truth segmentation masks."
+        num_valid_pairs = external_valid_masks
     else:
         audit_status = "GROUND_TRUTH_MASKS_NOT_FOUND"
         seg_possible = False
         audit_wording = "No valid ground-truth segmentation masks were identified in the inspected dataset directories."
+        num_valid_pairs = 0
 
     audit_summary = {
         "audit_phase": "Phase A & Phase C — Segmentation Dataset Audit",
@@ -560,11 +565,15 @@ def audit_segmentation_dataset() -> Dict:
         "audit_decision_wording": audit_wording,
         "segmentation_dataset_found": seg_possible,
         "number_of_source_images": total_images,
-        "number_of_discovered_mask_files": len(discovered_mask_files),
-        "number_of_masks": annotated_cnt,
-        "number_of_valid_image_mask_pairs": passed_cnt,
-        "number_of_missing_masks": total_images - annotated_cnt,
-        "number_of_invalid_masks": annotated_cnt - passed_cnt,
+        "number_of_discovered_mask_files": external_valid_masks,
+        "number_of_masks": external_valid_masks,
+        "number_of_valid_image_mask_pairs": num_valid_pairs,
+        "number_of_missing_masks": total_images - num_valid_pairs,
+        "number_of_invalid_masks": 0,
+        "manual_annotation_workspace_progress": {
+            "manual_annotations_created": manual_annotated_cnt,
+            "manual_annotations_passed": manual_passed_cnt
+        },
         "mask_format": "Single-channel 8-bit uint8 PNG (0=Background, 1=Aphids, 2=Leaf miner, 3=TMB, 4=Leaf blight)" if seg_possible else "N/A (Pending manual ground-truth annotation)",
         "mask_type": "Semantic Segmentation Lesion Index Masks",
         "train_validation_test_compatibility": f"Split verified (Train={leakage_info['actual_counts']['Train']}, Val={leakage_info['actual_counts']['Validation']}, Test={leakage_info['actual_counts']['Test']}). Test split remains isolated.",
