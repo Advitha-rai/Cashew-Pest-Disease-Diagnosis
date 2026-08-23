@@ -20,7 +20,15 @@ import argparse
 import sys
 import json
 import os
+import importlib
 from src.config import Config
+import src.segmentation as segmentation_module
+import src.segmentation_tool as segmentation_tool_module
+
+# Dynamically reload modules to prevent stale memory imports in Google Colab / Jupyter
+importlib.reload(segmentation_module)
+importlib.reload(segmentation_tool_module)
+
 from src.segmentation import (
     audit_segmentation_dataset,
     build_segmentation_annotation_manifest,
@@ -28,7 +36,9 @@ from src.segmentation import (
 )
 from src.segmentation_tool import (
     launch_colab_annotation_interface,
-    get_annotation_progress_report
+    get_annotation_progress_report,
+    run_minimal_colab_callback_test,
+    run_phase_c1_end_to_end_test
 )
 
 def main():
@@ -42,6 +52,8 @@ def main():
     parser.add_argument("--progress", action="store_true", help="Display detailed annotation progress report across eligible Train/Val pool")
     parser.add_argument("--split", type=str, default=None, choices=["Train", "Validation"], help="Filter annotation pool by split (Test split is strictly excluded)")
     parser.add_argument("--class", type=str, dest="class_name", default=None, choices=["Aphids", "Leaf miner", "TMB", "Leaf blight"], help="Filter annotation pool by target class")
+    parser.add_argument("--test-callback", action="store_true", help="Run minimal Google Colab callback test button")
+    parser.add_argument("--test-tool", action="store_true", help="Run Phase C.1 end-to-end verification test suite")
 
     args = parser.parse_args()
 
@@ -97,7 +109,19 @@ def main():
         print(f"Progress Percentage        : {rep['progress_percentage']}%\n")
         return
 
-    # 5. Annotate Option
+    # 5. Minimal Callback Test Option
+    if args.test_callback:
+        print("[CLI] Launching Minimal Google Colab Callback Communication Test...")
+        run_minimal_colab_callback_test()
+        return
+
+    # 6. End-to-End Test Option
+    if args.test_tool:
+        print("[CLI] Running Phase C.1 End-to-End Verification Test Suite...")
+        run_phase_c1_end_to_end_test()
+        return
+
+    # 7. Annotate Option
     if args.annotate:
         print(f"[CLI] Launching Interactive Colab Annotation Tool (Split={args.split}, Class={args.class_name})...")
         launch_colab_annotation_interface(split=args.split, class_name=args.class_name)
@@ -112,4 +136,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

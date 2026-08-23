@@ -5,6 +5,7 @@ Phase C.1: Interactive Manual Segmentation Annotation Tool (Google Colab / Jupyt
 Features:
   - Interactive HTML5 Canvas brush/paint drawing widget rendered directly in Google Colab / Jupyter Notebooks
   - Bi-directional JavaScript-to-Python communication via google.colab.output.register_callback()
+  - In-place dynamic image loading without browser reloads
   - Strict Test-Set Isolation (Test set images [861] excluded from annotation pool; eligible pool = Train [4,013] + Val [860])
   - Filtering by split ('Train', 'Validation') and target class ('Aphids', 'Leaf miner', 'TMB', 'Leaf blight')
   - 5-Class Pixel Mask Encoding (0=Background, 1=Aphids, 2=Leaf miner, 3=TMB, 4=Leaf blight)
@@ -21,6 +22,7 @@ import base64
 import io
 import json
 import logging
+import traceback
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -122,7 +124,7 @@ def get_annotation_progress_report() -> Dict:
 
 
 # ---------------------------------------------------------
-# 2. NEXT PENDING IMAGE RESUME SELECTOR
+# 2. NEXT PENDING IMAGE RESUME SELECTOR & PAYLOAD HELPER
 # ---------------------------------------------------------
 def get_next_pending_image(
     split: Optional[str] = None,
@@ -165,12 +167,41 @@ def get_next_pending_image(
     return first_row
 
 
+def prepare_image_payload(item: Optional[Dict]) -> Optional[Dict]:
+    """Prepares JSON-serializable image payload for HTML/JS rendering."""
+    if not item:
+        return None
+
+    img_path = item["image_path"]
+    if not os.path.exists(img_path):
+        mark_image_skipped(img_path, "Source file not found")
+        next_item = get_next_pending_image(split=item.get("split"), class_name=item.get("class_name"))
+        return prepare_image_payload(next_item)
+
+    with Image.open(img_path) as img:
+        w, h = img.size
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG")
+        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    return {
+        "image_path": img_path,
+        "image_name": os.path.basename(img_path),
+        "split": item["split"],
+        "class_name": item["class_name"],
+        "class_code": int(item["class_code"]),
+        "width": w,
+        "height": h,
+        "base64": img_b64
+    }
+
+
 # ---------------------------------------------------------
 # 3. MANUAL ANNOTATION SUBMISSION & RESIZING ENGINE
 # ---------------------------------------------------------
 def process_annotation_submission(
     image_path: str,
-    mask_input: any,  # np.ndarray or base64 data string
+    mask_input: any,
     split: str,
     class_name: str
 ) -> Tuple[bool, str, Dict]:
@@ -201,10 +232,10 @@ def process_annotation_submission(
             mask_img_pil = Image.open(io.BytesIO(mask_bytes))
             mask_2d = np.array(mask_img_pil)
             
-            # If RGBA, extract non-zero alpha or red/class channel
+            # Extract discrete single-channel class-ID index mask
             if mask_2d.ndim == 3 and mask_2d.shape[2] >= 3:
-                # If RGB/RGBA contains painted non-zero values, map non-zero to target class code
                 expected_code = CLASS_MASK_ENCODING.get(class_name, 1)
+                # Map painted non-zero RGBA pixels to target class_code
                 alpha_or_color = np.max(mask_2d[:, :, :3], axis=2) if mask_2d.shape[2] == 3 else mask_2d[:, :, 3]
                 mask_2d = np.where(alpha_or_color > 0, expected_code, 0).astype(np.uint8)
         except Exception as e:
@@ -234,6 +265,8 @@ def process_annotation_submission(
 
     expected_code = CLASS_MASK_ENCODING.get(class_name, 0)
     is_valid, msg, meta = validate_mask_file(image_path, expected_mask_path, expected_code)
+
+    meta["expected_mask_path"] = expected_mask_path
 
     # Update Manifest
     manifest_csv = os.path.join(seg_dir, "segmentation_annotation_manifest.csv")
@@ -297,52 +330,125 @@ def mark_image_skipped(image_path: str, reason: str = "Marked for human review")
 
 
 # ---------------------------------------------------------
-# 4. COLAB JAVASCRIPT-TO-PYTHON CALLBACK REGISTRATION
+# 4. GLOBAL COLAB CALLBACK HANDLERS (EXPLICIT PRINT LOGGING)
 # ---------------------------------------------------------
-def register_colab_callbacks(active_split: Optional[str] = "Train", active_class: Optional[str] = None):
-    """
-    Registers Google Colab callbacks for bi-directional JS-to-Python execution.
-    """
-    if not COLAB_AVAILABLE:
-        return
+def colab_test_callback():
+    """Minimal Colab callback test function."""
+    print("PYTHON CALLBACK SUCCESS")
+    return "CALLBACK_WORKED"
 
-    def save_mask_colab_handler(img_path, mask_b64, split, class_name):
-        logger.info(f"[COLAB CALLBACK] Received save_mask request for {img_path}")
-        is_valid, msg, meta = process_annotation_submission(img_path, mask_b64, split, class_name)
-        report = get_annotation_progress_report()
-        return {
-            "success": is_valid,
-            "message": msg,
-            "meta": meta,
-            "progress": report
-        }
 
-    def skip_image_colab_handler(img_path, reason):
-        logger.info(f"[COLAB CALLBACK] Received skip_image request for {img_path}")
-        res = mark_image_skipped(img_path, reason)
-        report = get_annotation_progress_report()
-        return {
-            "success": res,
-            "progress": report
-        }
+def colab_save_mask_handler(image_path, mask_b64, split, class_name):
+    """Global Colab handler for save_mask."""
+    print(f"[CALLBACK] notebook.save_mask received: {image_path}")
+    try:
+        is_valid, msg, meta = process_annotation_submission(image_path, mask_b64, split, class_name)
+        if is_valid:
+            saved_p = meta.get("expected_mask_path", "")
+            print(f"[SUCCESS] Mask saved:\n{saved_p}")
+            next_item = get_next_pending_image(split=split, class_name=None)
+            report = get_annotation_progress_report()
+            payload = prepare_image_payload(next_item) if next_item else None
+            return {
+                "success": True,
+                "message": msg,
+                "next_item": payload,
+                "progress": report
+            }
+        else:
+            print(f"[ERROR] Validation failed: {msg}")
+            return {
+                "success": False,
+                "message": msg,
+                "next_item": None,
+                "progress": get_annotation_progress_report()
+            }
+    except Exception as e:
+        err_detail = traceback.format_exc()
+        print(f"[ERROR] {str(e)}\n{err_detail}")
+        return {"success": False, "message": str(e), "next_item": None}
 
-    def load_next_colab_handler(split, class_name):
-        logger.info(f"[COLAB CALLBACK] Loading next pending image for Split={split}, Class={class_name}")
+
+def colab_skip_image_handler(image_path, reason="Marked for human review", split="Train", class_name=None):
+    """Global Colab handler for skip_image."""
+    print(f"[CALLBACK] notebook.skip_image received: {image_path}")
+    try:
+        res = mark_image_skipped(image_path, reason)
+        print(f"[SUCCESS] Image skipped:\n{image_path}")
         next_item = get_next_pending_image(split=split, class_name=class_name)
         report = get_annotation_progress_report()
+        payload = prepare_image_payload(next_item) if next_item else None
         return {
-            "item": next_item,
+            "success": res,
+            "next_item": payload,
             "progress": report
         }
+    except Exception as e:
+        err_detail = traceback.format_exc()
+        print(f"[ERROR] {str(e)}\n{err_detail}")
+        return {"success": False, "message": str(e), "next_item": None}
 
-    output.register_callback('notebook.save_mask', save_mask_colab_handler)
-    output.register_callback('notebook.skip_image', skip_image_colab_handler)
-    output.register_callback('notebook.load_next', load_next_colab_handler)
-    logger.info("[COLAB BRIDGE] Successfully registered notebook callbacks (save_mask, skip_image, load_next).")
+
+# Register Global Callbacks at Module Load Time
+if COLAB_AVAILABLE:
+    try:
+        output.register_callback("test.callback", colab_test_callback)
+        output.register_callback("notebook.save_mask", colab_save_mask_handler)
+        output.register_callback("notebook.skip_image", colab_skip_image_handler)
+        logger.info("[COLAB BRIDGE] Globally registered notebook callbacks: test.callback, notebook.save_mask, notebook.skip_image")
+    except Exception as e:
+        logger.warning(f"[COLAB BRIDGE WARNING] Could not register global callbacks: {e}")
 
 
 # ---------------------------------------------------------
-# 5. GOOGLE COLAB / JUPYTER INTERACTIVE CANVAS DISPLAY ENGINE
+# 5. MINIMAL CALLBACK TEST FUNCTION
+# ---------------------------------------------------------
+def run_minimal_colab_callback_test():
+    """
+    Renders a minimal HTML/JS button to verify bi-directional Colab callback execution.
+    Clicking button prints: PYTHON CALLBACK SUCCESS in Python console stdout.
+    """
+    if COLAB_AVAILABLE:
+        output.register_callback("test.callback", colab_test_callback)
+
+    html_code = """
+    <div style="padding:15px; border:2px solid #28A745; border-radius:6px; background:#F4F9F5; font-family:Arial, sans-serif;">
+        <h4 style="margin-top:0; color:#28A745;">🧪 Minimal Google Colab Callback Communication Test</h4>
+        <p>Click the button below. It must invoke Python and print <code>PYTHON CALLBACK SUCCESS</code> in stdout.</p>
+        <button onclick="triggerTestCallback()" style="background:#28A745; color:white; border:none; padding:10px 18px; border-radius:4px; font-weight:bold; cursor:pointer;">
+            Test Colab Callback Connection
+        </button>
+        <div id="test-status" style="margin-top:10px; font-weight:bold; color:#1F497D;">Status: Ready to test...</div>
+    </div>
+
+    <script>
+    function triggerTestCallback() {
+        document.getElementById('test-status').innerText = "⏳ Calling Python test.callback...";
+        if (window.google && google.colab && google.colab.kernel) {
+            google.colab.kernel.invokeFunction('test.callback', [], {})
+                .then(function(res) {
+                    var out = res.data['application/json'] || res.data['text/plain'];
+                    document.getElementById('test-status').style.color = "#28A745";
+                    document.getElementById('test-status').innerText = "✅ Response: " + JSON.stringify(out);
+                }).catch(function(err) {
+                    document.getElementById('test-status').style.color = "#DC3545";
+                    document.getElementById('test-status').innerText = "❌ Callback Error: " + err;
+                });
+        } else {
+            document.getElementById('test-status').innerText = "Local Jupyter environment detected (not Colab runtime).";
+        }
+    }
+    </script>
+    """
+    try:
+        from IPython.display import HTML, display
+        display(HTML(html_code))
+    except ImportError:
+        print("[MINIMAL TEST] Open in Jupyter/Colab notebook to interactively test button.")
+
+
+# ---------------------------------------------------------
+# 6. GOOGLE COLAB / JUPYTER INTERACTIVE CANVAS DISPLAY ENGINE
 # ---------------------------------------------------------
 def launch_colab_annotation_interface(
     split: Optional[str] = "Train",
@@ -351,11 +457,8 @@ def launch_colab_annotation_interface(
 ):
     """
     Renders an interactive HTML5 Canvas drawing widget directly inside Google Colab or Jupyter notebooks.
-    Provides brush size controls, eraser, clear, undo, redo, save mask, skip image, next image, and live progress banner.
+    Updates DOM in-place without full-page reloads upon save or skip actions.
     """
-    if COLAB_AVAILABLE:
-        register_colab_callbacks(active_split=split, active_class=class_name)
-
     next_item = get_next_pending_image(split=split, class_name=class_name)
     rep = get_annotation_progress_report()
 
@@ -367,26 +470,22 @@ def launch_colab_annotation_interface(
         print(f"Progress       : {rep['progress_percentage']}%\n")
         return
 
-    img_path = next_item["image_path"]
-    curr_split = next_item["split"]
-    curr_class = next_item["class_name"]
-    curr_code = next_item["class_code"]
-
-    if not os.path.exists(img_path):
-        print(f"Image file not found on disk: {img_path}. Skipping...")
-        mark_image_skipped(img_path, "Source file not found")
+    payload = prepare_image_payload(next_item)
+    if not payload:
+        print("Could not load image payload. Re-trying...")
         return launch_colab_annotation_interface(split=split, class_name=class_name)
 
-    # Encode Image to Base64 for HTML Rendering
-    with Image.open(img_path) as img:
-        w, h = img.size
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG")
-        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    img_path = payload["image_path"]
+    curr_split = payload["split"]
+    curr_class = payload["class_name"]
+    curr_code = payload["class_code"]
+    w = payload["width"]
+    h = payload["height"]
+    img_b64 = payload["base64"]
 
     html_code = f"""
     <div id="annotation-widget-container" style="font-family: Arial, sans-serif; max-width: 920px; padding: 18px; border: 2px solid #1F497D; border-radius: 8px; background-color: #F8F9FA;">
-        <h3 style="margin-top:0; color:#1F497D;">🎨 Cashew Leaf Manual Segmentation Tool (Phase C.1)</h3>
+        <h3 style="margin-top:0; color:#1F497D;">🎨 Cashew Leaf Manual Segmentation Tool (Phase C.1 Repaired)</h3>
         
         <!-- Live Progress Banner -->
         <div style="background:#E9ECEF; padding:12px; border-radius:6px; margin-bottom:12px; font-size:13px; display:flex; flex-wrap:wrap; gap:15px; justify-content:space-between;">
@@ -400,16 +499,16 @@ def launch_colab_annotation_interface(
         </div>
 
         <div style="display: flex; gap: 15px; margin-bottom: 12px; background:#FFF; padding:10px; border:1px solid #DEE2E6; border-radius:4px;">
-            <div><strong>Current Split:</strong> <span style="color:#2b5c8f; font-weight:bold;">{curr_split}</span></div>
-            <div><strong>Target Class:</strong> <span style="color:#e07a5f; font-weight:bold;">{curr_class} (Code {curr_code})</span></div>
-            <div><strong>Dimensions:</strong> {w} x {h} px</div>
-            <div><strong>File:</strong> <span style="font-family:monospace;">{os.path.basename(img_path)}</span></div>
+            <div><strong>Current Split:</strong> <span id="lbl-split" style="color:#2b5c8f; font-weight:bold;">{curr_split}</span></div>
+            <div><strong>Target Class:</strong> <span id="lbl-class" style="color:#e07a5f; font-weight:bold;">{curr_class} (Code {curr_code})</span></div>
+            <div><strong>Dimensions:</strong> <span id="lbl-dims">{w} x {h} px</span></div>
+            <div><strong>File:</strong> <span id="lbl-file" style="font-family:monospace;">{os.path.basename(img_path)}</span></div>
         </div>
 
         <!-- Controls Bar -->
         <div style="background:#E9ECEF; padding:10px; border-radius:5px; margin-bottom:12px; display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
             <label><strong>Brush Size:</strong> <input type="range" id="brush-size" min="1" max="50" value="14" oninput="updateBrushSize(this.value)"><span id="brush-val">14</span>px</label>
-            <button onclick="setMode('brush')" id="btn-brush" style="background:#1F497D; color:white; border:none; padding:6px 12px; border-radius:4px; cursor:pointer; font-weight:bold;">🖌️ Paint Lesion (Code {curr_code})</button>
+            <button onclick="setMode('brush')" id="btn-brush" style="background:#1F497D; color:white; border:none; padding:6px 12px; border-radius:4px; cursor:pointer; font-weight:bold;">🖌️ Paint Lesion</button>
             <button onclick="setMode('eraser')" id="btn-eraser" style="background:#6C757D; color:white; border:none; padding:6px 12px; border-radius:4px; cursor:pointer; font-weight:bold; opacity:0.6;">🧹 Eraser (Code 0)</button>
             <button onclick="undoStroke()" style="background:#17A2B8; color:white; border:none; padding:6px 12px; border-radius:4px; cursor:pointer; font-weight:bold;">↩️ Undo</button>
             <button onclick="clearCanvas()" style="background:#DC3545; color:white; border:none; padding:6px 12px; border-radius:4px; cursor:pointer; font-weight:bold;">🗑️ Clear</button>
@@ -432,10 +531,10 @@ def launch_colab_annotation_interface(
     </div>
 
     <script>
-        var imgPath = "{img_path.replace('\\\\', '/')}";
-        var splitName = "{curr_split}";
-        var className = "{curr_class}";
-        var classCode = {curr_code};
+        var currentImgPath = "{img_path.replace('\\\\', '/')}";
+        var currentSplit = "{curr_split}";
+        var currentClass = "{curr_class}";
+        var currentCode = {curr_code};
         
         var canvas = document.getElementById('mask-canvas');
         var ctx = canvas.getContext('2d');
@@ -511,7 +610,7 @@ def launch_colab_annotation_interface(
             
             if (mode === 'brush') {{
                 maskCtx.globalCompositeOperation = 'source-over';
-                maskCtx.fillStyle = 'rgb(' + classCode + ',' + classCode + ',' + classCode + ')';
+                maskCtx.fillStyle = 'rgb(' + currentCode + ',' + currentCode + ',' + currentCode + ')';
                 maskCtx.strokeStyle = maskCtx.fillStyle;
                 maskCtx.beginPath();
                 maskCtx.arc(pos.x, pos.y, brushSize / 2, 0, Math.PI * 2);
@@ -546,41 +645,88 @@ def launch_colab_annotation_interface(
             return maskCanvas.toDataURL('image/png');
         }}
 
+        function updateProgressUI(rep) {{
+            if (!rep) return;
+            if (document.getElementById('stat-annotated')) document.getElementById('stat-annotated').innerText = rep.annotated_count;
+            if (document.getElementById('stat-passed')) document.getElementById('stat-passed').innerText = rep.passed_validation_count;
+            if (document.getElementById('stat-skipped')) document.getElementById('stat-skipped').innerText = rep.skipped_review_count;
+            if (document.getElementById('stat-pending')) document.getElementById('stat-pending').innerText = rep.pending_count;
+            if (document.getElementById('stat-progress')) document.getElementById('stat-progress').innerText = rep.progress_percentage + '%';
+        }}
+
+        function loadNextImageInPlace(item) {{
+            if (!item) {{
+                document.getElementById('annotation-widget-container').innerHTML = "<h3 style='color:#28A745;'>🎉 ALL ELIGIBLE TRAIN/VALIDATION IMAGES ARE ANNOTATED! 🎉</h3>";
+                return;
+            }}
+            currentImgPath = item.image_path;
+            currentSplit = item.split;
+            currentClass = item.class_name;
+            currentCode = item.class_code;
+
+            document.getElementById('lbl-split').innerText = currentSplit;
+            document.getElementById('lbl-class').innerText = currentClass + ' (Code ' + currentCode + ')';
+            document.getElementById('lbl-dims').innerText = item.width + ' x ' + item.height + ' px';
+            document.getElementById('lbl-file').innerText = item.image_name;
+
+            document.getElementById('bg-img').src = "data:image/jpeg;base64," + item.base64;
+            
+            canvas.width = item.width;
+            canvas.height = item.height;
+            maskCanvas.width = item.width;
+            maskCanvas.height = item.height;
+            
+            clearCanvas();
+            
+            document.getElementById('btn-save').disabled = false;
+            document.getElementById('btn-skip').disabled = false;
+            document.getElementById('status-msg').style.color = "#1F497D";
+            document.getElementById('status-msg').innerText = "Ready: Paint visible affected lesion and click Save Mask & Next.";
+        }}
+
         function skipImage() {{
             document.getElementById('status-msg').style.color = "#FFC107";
             document.getElementById('status-msg').innerText = "⏳ Marking image skipped for review...";
+            document.getElementById('btn-skip').disabled = true;
             
             if (window.google && google.colab && google.colab.kernel) {{
-                google.colab.kernel.invokeFunction('notebook.skip_image', [imgPath, "Marked for human review"], {{}})
+                google.colab.kernel.invokeFunction('notebook.skip_image', [currentImgPath, "Marked for human review", currentSplit, currentClass], {{}})
                     .then(function(res) {{
-                        document.getElementById('status-msg').style.color = "#28A745";
-                        document.getElementById('status-msg').innerText = "✅ Image marked skipped. Reloading next image...";
-                        setTimeout(function() {{
-                            location.reload();
-                        }}, 400);
+                        var data = res.data['application/json'];
+                        if (data && data.success) {{
+                            updateProgressUI(data.progress);
+                            document.getElementById('status-msg').style.color = "#28A745";
+                            document.getElementById('status-msg').innerText = "✅ Image marked skipped. Loading next image...";
+                            loadNextImageInPlace(data.next_item);
+                        }}
+                    }}).catch(function(err) {{
+                        document.getElementById('btn-skip').disabled = false;
+                        document.getElementById('status-msg').style.color = "#DC3545";
+                        document.getElementById('status-msg').innerText = "❌ Callback Error: " + err;
                     }});
             }} else {{
-                document.getElementById('status-msg').innerText = "Skipped local image. Run Python helper to proceed.";
+                document.getElementById('status-msg').innerText = "Local Jupyter execution detected.";
             }}
         }}
 
         function saveAndNext() {{
             document.getElementById('status-msg').style.color = "#17A2B8";
-            document.getElementById('status-msg').innerText = "⏳ Validating & saving single-channel mask...";
+            document.getElementById('status-msg').innerText = "⏳ Validating & saving single-channel uint8 mask...";
             document.getElementById('btn-save').disabled = true;
 
             var rawMaskB64 = getRawMaskBase64();
 
             if (window.google && google.colab && google.colab.kernel) {{
-                google.colab.kernel.invokeFunction('notebook.save_mask', [imgPath, rawMaskB64, splitName, className], {{}})
+                google.colab.kernel.invokeFunction('notebook.save_mask', [currentImgPath, rawMaskB64, currentSplit, currentClass], {{}})
                     .then(function(res) {{
                         var data = res.data['application/json'];
                         if (data && data.success) {{
+                            updateProgressUI(data.progress);
                             document.getElementById('status-msg').style.color = "#28A745";
                             document.getElementById('status-msg').innerText = "✅ Mask validated & saved! Loading next image...";
                             setTimeout(function() {{
-                                location.reload();
-                            }}, 400);
+                                loadNextImageInPlace(data.next_item);
+                            }}, 300);
                         }} else {{
                             document.getElementById('btn-save').disabled = false;
                             document.getElementById('status-msg').style.color = "#DC3545";
@@ -590,10 +736,10 @@ def launch_colab_annotation_interface(
                     }}).catch(function(err) {{
                         document.getElementById('btn-save').disabled = false;
                         document.getElementById('status-msg').style.color = "#DC3545";
-                        document.getElementById('status-msg').innerText = "❌ Bridge Error: " + err;
+                        document.getElementById('status-msg').innerText = "❌ Callback Error: " + err;
                     }});
             }} else {{
-                document.getElementById('status-msg').innerText = "Local Jupyter environment detected. Triggering Python save handler...";
+                document.getElementById('status-msg').innerText = "Local Jupyter execution detected.";
             }}
         }}
     </script>
@@ -608,7 +754,7 @@ def launch_colab_annotation_interface(
 
 
 # ---------------------------------------------------------
-# 6. END-TO-END VERIFICATION TEST SUITE
+# 7. END-TO-END VERIFICATION TEST SUITE
 # ---------------------------------------------------------
 def run_phase_c1_end_to_end_test() -> Dict:
     """
