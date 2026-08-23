@@ -502,7 +502,7 @@ def audit_segmentation_dataset() -> Dict:
     seg_dir = Config.get_segmentation_dir()
     doc_dir = Config.get_documentation_dir()
 
-    # Search directories to inspect (excluding existing Annotations directory)
+    # Search directories to inspect (excluding existing Annotations, Documentation, Logs, and Experiments)
     search_dirs = [
         base_dir,
         Config.get_raw_dir(),
@@ -512,17 +512,30 @@ def audit_segmentation_dataset() -> Dict:
         os.path.join(base_dir, "Masks")
     ]
 
+    MASK_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".npy", ".npz"}
+    EXCLUDED_EXTENSIONS = {".md", ".txt", ".csv", ".json", ".py", ".ipynb", ".log", ".html", ".pdf", ".zip", ".xml", ".yaml", ".yml"}
+
     discovered_mask_files = []
-    annotations_base = os.path.join(seg_dir, "Annotations")
+    annotations_base = os.path.abspath(os.path.join(seg_dir, "Annotations"))
+    doc_base = os.path.abspath(doc_dir)
+    logs_base = os.path.abspath(Config.get_logs_dir())
+    exp_base = os.path.abspath(os.path.join(base_dir, "Experiments"))
 
     for s_dir in search_dirs:
         if not os.path.exists(s_dir):
             continue
         for root, _, files in os.walk(s_dir):
-            # Exclude Experiments/Segmentation/Annotations from external search
-            if os.path.abspath(root).startswith(os.path.abspath(annotations_base)):
+            abs_root = os.path.abspath(root)
+            # Exclude Annotations, Documentation, Logs, and Experiments from external mask search
+            if (abs_root.startswith(annotations_base) or
+                abs_root.startswith(doc_base) or
+                abs_root.startswith(logs_base) or
+                abs_root.startswith(exp_base)):
                 continue
             for file in files:
+                ext = os.path.splitext(file)[1].lower()
+                if ext in EXCLUDED_EXTENSIONS or ext not in MASK_EXTENSIONS:
+                    continue
                 f_lower = file.lower()
                 if any(kw in f_lower for kw in ["mask", "_seg", "polygon", "labelme"]):
                     discovered_mask_files.append(os.path.join(root, file))
