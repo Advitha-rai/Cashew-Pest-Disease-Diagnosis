@@ -3426,21 +3426,25 @@ def run_phase_c1_verification_suite() -> Dict[str, Any]:
             compute_file_hash(dummy_test)
         )
 
+        permission_rejected = False
         try:
-
-            process_annotation_submission(
-                dummy_test,
-                _make_dummy_mask(2),
+            assert_annotation_allowed(
                 "Test",
-                "Leaf_Miner",
-                temp_manifest,
+                dummy_test,
+                test_csv_path=temp_test_csv,
             )
-
-            annotation_blocked = False
-
         except PermissionError:
+            permission_rejected = True
 
-            annotation_blocked = True
+        res_valid, _, res_meta = process_annotation_submission(
+            dummy_test,
+            _make_dummy_mask(2),
+            "Test",
+            "Leaf_Miner",
+            temp_manifest,
+        )
+        submission_rejected = (res_valid is False and res_meta.get("error_code") == "ANNOTATION_NOT_ALLOWED")
+        annotation_blocked = (permission_rejected and submission_rejected)
 
         test_hash_after = (
             compute_file_hash(dummy_test)
