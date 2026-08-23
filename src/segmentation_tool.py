@@ -3659,6 +3659,30 @@ def run_phase_c1_verification_suite() -> Dict[str, Any]:
             len(model.redo_stack) == 0
         )
 
+        print("\n===== TEST 22 ACTUAL INTERNAL VALUES =====")
+        print("initial_empty =", repr(initial_empty))
+        print("painted       =", repr(painted))
+        print("undo_ok       =", repr(undo_ok))
+        print("redo_ok       =", repr(redo_ok))
+        print("redo_cleared  =", repr(redo_cleared))
+        print("clear_empty   =", repr(clear_empty))
+        print("clear_undo    =", repr(clear_undo))
+        print("clear_ok      =", repr(clear_ok))
+        print("reset_ok      =", repr(reset_ok))
+
+        _test22_values = [
+            initial_empty,
+            painted,
+            undo_ok,
+            redo_ok,
+            redo_cleared,
+            clear_ok,
+            reset_ok,
+        ]
+
+        print("TEST22_VALUES =", _test22_values)
+        print("TEST22_ALL =", all(_test22_values))
+
         test_results[
             "TEST_22_undo_redo_state_reset"
         ] = (
