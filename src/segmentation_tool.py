@@ -1546,6 +1546,7 @@ class CanvasHistoryStateModel:
 def build_annotation_html(
     item: Dict[str, Any],
     progress: Dict[str, Any],
+    manifest_csv: str | Path | None = None,
     debug_ui: bool = False,
 ) -> str:
 
@@ -1576,6 +1577,10 @@ def build_annotation_html(
 
     progress_json = json.dumps(
         make_json_safe(progress)
+    )
+
+    manifest_json = json.dumps(
+        str(manifest_csv or get_manifest_path())
     )
 
     return f"""
@@ -1895,6 +1900,9 @@ var currentClass =
 
 var currentCode =
 {int(item["class_code"])};
+
+var currentManifest =
+{manifest_json};
 
 var displayCanvas =
 document.getElementById("display-canvas");
@@ -2530,7 +2538,8 @@ function skipImage() {{
                 currentImgPath,
                 "Manual review skipped",
                 currentSplit,
-                currentClass
+                currentClass,
+                currentManifest
             ],
             {{}}
         )
@@ -2629,7 +2638,8 @@ function saveAndNext() {{
                 currentImgPath,
                 rawMaskB64,
                 currentSplit,
-                currentClass
+                currentClass,
+                currentManifest
             ],
             {{}}
         )
@@ -2740,6 +2750,7 @@ def show_annotation_tool(
     html = build_annotation_html(
         item,
         progress,
+        manifest_csv=manifest_csv,
         debug_ui=debug_ui,
     )
 
