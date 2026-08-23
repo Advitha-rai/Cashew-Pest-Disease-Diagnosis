@@ -615,6 +615,7 @@ def run_minimal_colab_callback_test():
 def launch_colab_annotation_interface(
     split: Optional[str] = "Train",
     class_name: Optional[str] = None,
+    pilot: bool = False,
     auto_resume: bool = True
 ):
     """
@@ -623,6 +624,11 @@ def launch_colab_annotation_interface(
     """
     if COLAB_AVAILABLE:
         register_colab_callbacks()
+
+    if pilot:
+        split = "Train"
+        print("=== PILOT ANNOTATION WORKFLOW ACTIVE ===")
+        print("Target: 10 images per class from TRAIN (Total = 40 candidate pilot images for human annotation)")
 
     next_item = get_next_pending_image(split=split, class_name=class_name)
     rep = get_annotation_progress_report()

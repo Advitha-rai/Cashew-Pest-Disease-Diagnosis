@@ -53,6 +53,7 @@ def main():
     parser.add_argument("--progress", action="store_true", help="Display detailed annotation progress report across eligible Train/Val pool")
     parser.add_argument("--split", type=str, default=None, choices=["Train", "Validation"], help="Filter annotation pool by split (Test split is strictly excluded)")
     parser.add_argument("--class", type=str, dest="class_name", default=None, choices=["Aphids", "Leaf miner", "TMB", "Leaf blight"], help="Filter annotation pool by target class")
+    parser.add_argument("--pilot", action="store_true", help="Launch initial pilot annotation workflow (10 Train images per class = 40 candidate pilot images for human annotation)")
     parser.add_argument("--test-callback", action="store_true", help="Run minimal Google Colab callback test button")
     parser.add_argument("--test-suite", action="store_true", help="Run Phase C.1 truthful 25-test automated verification suite")
     parser.add_argument("--test-audit", action="store_true", help="Run Phase C 12-test automated audit & validation verification suite")
@@ -129,7 +130,13 @@ def main():
         run_phase_c_audit_verification_suite()
         return
 
-    # 8. Annotate Option
+    # 8. Pilot Option
+    if args.pilot:
+        print("[CLI] Launching Pilot Annotation Workflow (10 Train images per class = 40 candidate pilot images for human annotation)...")
+        launch_colab_annotation_interface(split="Train", pilot=True)
+        return
+
+    # 9. Annotate Option
     if args.annotate:
         print(f"[CLI] Launching Interactive Colab Annotation Tool (Split={args.split}, Class={args.class_name})...")
         launch_colab_annotation_interface(split=args.split, class_name=args.class_name)
