@@ -96,6 +96,59 @@ def make_json_safe(obj: Any) -> Any:
     return obj
 
 
+class CanvasHistoryStateModel:
+    """
+    Deterministic Python-side simulation of the exact JavaScript Canvas history contract used in Colab.
+    Models undoStack, redoStack, saveState(), undoStroke(), redoStroke(), clearCanvas(), loadNextImage().
+    """
+    def __init__(self, width: int = 100, height: int = 100, max_history: int = 25):
+        self.width = width
+        self.height = height
+        self.max_history = max_history
+        self.undo_stack: List[np.ndarray] = []
+        self.redo_stack: List[np.ndarray] = []
+        self.current_state = np.zeros((height, width), dtype=np.uint8)
+        self.save_state()
+
+    def save_state(self) -> None:
+        self.undo_stack.append(self.current_state.copy())
+        if len(self.undo_stack) > self.max_history:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+
+    def paint_stroke(self, y1: int, y2: int, x1: int, x2: int, code: int) -> None:
+        self.current_state[y1:y2, x1:x2] = code
+        self.save_state()
+
+    def undo_stroke(self) -> bool:
+        if len(self.undo_stack) > 1:
+            popped = self.undo_stack.pop()
+            self.redo_stack.append(popped)
+            self.current_state = self.undo_stack[-1].copy()
+            return True
+        return False
+
+    def redo_stroke(self) -> bool:
+        if len(self.redo_stack) > 0:
+            state = self.redo_stack.pop()
+            self.undo_stack.append(state.copy())
+            self.current_state = state.copy()
+            return True
+        return False
+
+    def clear_canvas(self) -> None:
+        self.current_state = np.zeros((self.height, self.width), dtype=np.uint8)
+        self.save_state()
+
+    def load_next_image(self, new_w: int = 100, new_h: int = 100) -> None:
+        self.width = new_w
+        self.height = new_h
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.current_state = np.zeros((new_h, new_w), dtype=np.uint8)
+        self.save_state()
+
+
 def compute_file_hash(filepath: str) -> str:
     """Computes SHA-256 hash of a file for integrity verification."""
     if not os.path.exists(filepath):
@@ -1352,24 +1405,22 @@ def run_phase_c1_verification_suite() -> Dict[str, Any]:
         dup2 = register_colab_callbacks()
         test_results["TEST_21_duplicate_registration"] = "PASS" if (isinstance(dup1, dict) and isinstance(dup2, dict) and dup1.get("callbacks", {}).keys() == dup2.get("callbacks", {}).keys()) else "FAIL"
 
-        # TEST 22: Undo/Redo State Reset
-        undo_stack = []
-        redo_stack = []
-        canvas_state = np.zeros((100, 100), dtype=np.uint8)
-        undo_stack.append(canvas_state.copy())
-        stroke1 = canvas_state.copy()
-        stroke1[10:20, 10:20] = 3
-        undo_stack.append(stroke1.copy())
-        redo_stack.append(undo_stack.pop())
-        undone_state = undo_stack[-1]
-        undo_ok = np.array_equal(undone_state, canvas_state)
-        redone_state = redo_stack.pop()
-        undo_stack.append(redone_state)
-        redo_ok = np.array_equal(redone_state, stroke1)
-        undo_stack = []
-        redo_stack = []
-        reset_ok = (len(undo_stack) == 0 and len(redo_stack) == 0)
-        test_results["TEST_22_undo_redo_state_reset"] = "PASS" if (undo_ok and redo_ok and reset_ok) else "FAIL"
+        # TEST 22: Truthful Undo/Redo & State Reset Model Verification
+        model = CanvasHistoryStateModel(100, 100)
+        init_ok = (len(model.undo_stack) == 1 and len(model.redo_stack) == 0)
+        model.paint_stroke(10, 30, 10, 30, 3)
+        stroke1_ok = (len(model.undo_stack) == 2 and np.count_nonzero(model.current_state) > 0)
+        undo_ok = model.undo_stroke() and (np.count_nonzero(model.current_state) == 0) and (len(model.redo_stack) == 1)
+        redo_ok = model.redo_stroke() and (np.count_nonzero(model.current_state) > 0) and (len(model.redo_stack) == 0)
+        model.undo_stroke()
+        model.paint_stroke(40, 50, 40, 50, 1)
+        new_stroke_clears_redo = (len(model.redo_stack) == 0)
+        model.clear_canvas()
+        clear_ok = (np.count_nonzero(model.current_state) == 0) and (len(model.undo_stack) == 4)
+        model.load_next_image(120, 120)
+        reset_ok = (len(model.undo_stack) == 1 and len(model.redo_stack) == 0 and model.width == 120)
+        t22_pass = (init_ok and stroke1_ok and undo_ok and redo_ok and new_stroke_clears_redo and clear_ok and reset_ok)
+        test_results["TEST_22_undo_redo_state_reset"] = "PASS" if t22_pass else "FAIL"
 
         # TEST 23: Filter Preservation
         dummy_tmb_p2 = os.path.join(temp_dir, "dummy_tmb_2.jpg")
