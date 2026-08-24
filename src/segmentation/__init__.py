@@ -1,39 +1,46 @@
 """
 Cashew Pest and Disease Diagnosis System
-Phase C.1: Compatibility Shim for src.segmentation_tool
-Delegates to the canonical modular src.segmentation package.
+Phase C: Manual Cashew Leaf Segmentation Package
+Framework: TensorFlow / Keras
+
+Public API:
+    - initialize_segmentation()
+    - launch_segmentation_tool()
+    - get_annotation_progress()
+    - process_annotation_submission()
+    - skip_annotation()
 """
 
-from src.segmentation.config import (
+from .config import (
     SegmentationConfig,
     normalize_class_name,
     get_class_code,
 )
-from src.segmentation.history import CanvasHistoryStateModel
-from src.segmentation.validation import (
+from .history import CanvasHistoryStateModel
+from .validation import (
     validate_mask_file,
     validate_mask_array,
     assert_annotation_allowed,
     compute_file_hash,
 )
-from src.segmentation.manifest import (
+from .manifest import (
     load_manifest,
     save_manifest_atomically,
     build_segmentation_manifest,
     get_next_pending_image,
     get_annotation_progress_report,
 )
-from src.segmentation.callbacks import (
+from .callbacks import (
     register_colab_callbacks,
     decode_colab_response_payload,
     make_json_safe,
     colab_callback_health_check,
 )
-from src.segmentation.ui import (
+from .ui import (
     build_annotation_html,
     image_to_base64,
 )
-from src.segmentation.pipeline import (
+from .pipeline import (
     initialize_segmentation,
     launch_segmentation_tool,
     process_annotation_submission,
@@ -42,12 +49,6 @@ from src.segmentation.pipeline import (
     colab_save_mask_handler,
     colab_skip_image_handler,
 )
-
-# Compatibility Aliases for Legacy Function Names
-launch_colab_annotation_interface = launch_segmentation_tool
-show_annotation_tool = launch_segmentation_tool
-initialize_phase_c1 = initialize_segmentation
-run_minimal_colab_callback_test = colab_callback_health_check
 
 __all__ = [
     "SegmentationConfig",
@@ -71,13 +72,9 @@ __all__ = [
     "image_to_base64",
     "initialize_segmentation",
     "launch_segmentation_tool",
-    "launch_colab_annotation_interface",
-    "show_annotation_tool",
     "process_annotation_submission",
     "skip_annotation",
     "get_annotation_progress",
     "colab_save_mask_handler",
     "colab_skip_image_handler",
-    "initialize_phase_c1",
-    "run_minimal_colab_callback_test",
 ]
