@@ -33,6 +33,7 @@ from src.segmentation import (
     audit_segmentation_dataset,
     build_segmentation_annotation_manifest,
     validate_all_manifest_masks,
+    check_segmentation_readiness,
     run_phase_c_audit_verification_suite
 )
 from src.segmentation_tool import (
@@ -48,6 +49,7 @@ def main():
     parser.add_argument("--audit", action="store_true", help="Perform segmentation dataset audit & enforce GROUND_TRUTH_MASKS_NOT_FOUND status")
     parser.add_argument("--manifest", action="store_true", help="Build/refresh 5,734-image segmentation annotation manifest")
     parser.add_argument("--validate", action="store_true", help="Run strict quality-control validation on all created manual masks")
+    parser.add_argument("--readiness", action="store_true", help="Run comprehensive segmentation training readiness check")
     parser.add_argument("--summary", action="store_true", help="Display annotation status summary (Assigned, Annotated, Pending, Validated)")
     parser.add_argument("--annotate", action="store_true", help="Launch interactive Colab/Jupyter manual annotation interface")
     parser.add_argument("--progress", action="store_true", help="Display detailed annotation progress report across eligible Train/Val pool")
@@ -96,6 +98,20 @@ def main():
         print(f"Passed Validation          : {passed}")
         print(f"Failed Validation          : {failed}")
         print(f"Pending Annotations        : {pending}\n")
+        return
+
+    # 3b. Readiness Option
+    if args.readiness:
+        print("[CLI] Executing Segmentation Training Readiness Check...")
+        r_info = check_segmentation_readiness()
+        print("\n--- SEGMENTATION TRAINING READINESS REPORT ---")
+        print(f"Source Images Total        : {r_info['source_images_total']} (Train={r_info['train_images']}, Val={r_info['validation_images']}, Test={r_info['test_images']})")
+        print(f"Valid Image-Mask Pairs     : {r_info['valid_image_mask_pairs']}")
+        print(f"Missing Masks              : {r_info['missing_masks']}")
+        print(f"Invalid Masks              : {r_info['invalid_masks']}")
+        print(f"Orphan Masks               : {r_info['orphan_masks']}")
+        print(f"Test Modification Detected : {r_info['test_modification_detected']}")
+        print(f"Segmentation Training Ready: {r_info['segmentation_training_ready']}\n")
         return
 
     # 4. Progress Option

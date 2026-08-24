@@ -484,8 +484,135 @@ def save_manual_annotation_mask(
 
 
 # ---------------------------------------------------------
-# 8. DATASET AUDIT ENGINE (PHASE A & C REVISED)
+# 8. SEGMENTATION READINESS & COMPREHENSIVE AUDIT ENGINE
 # ---------------------------------------------------------
+def check_segmentation_readiness(manifest_csv: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Performs an exhaustive audit of all annotation masks and manifest records to evaluate segmentation training readiness.
+    Evaluates:
+      - Total images by split (Train, Validation, Test)
+      - Existing masks by split
+      - Valid image-mask pairs vs missing, invalid, or orphan masks
+      - Specific mask failure categories: empty, wrong dimensions, invalid pixel values, missing expected class
+      - Annotation status counts: annotated, skipped, pending
+      - Test split modification detection
+      - Segmentation training readiness flag
+    """
+    seg_dir = Config.get_segmentation_dir()
+    if manifest_csv is None:
+        manifest_csv = os.path.join(seg_dir, "segmentation_annotation_manifest.csv")
+
+    if not os.path.exists(manifest_csv):
+        df_manifest = build_segmentation_annotation_manifest()
+    else:
+        df_manifest = pd.read_csv(manifest_csv)
+
+    annotations_base = os.path.join(seg_dir, "Annotations")
+
+    source_images_total = len(df_manifest)
+    train_images = int((df_manifest["split"] == "Train").sum())
+    validation_images = int((df_manifest["split"] == "Validation").sum())
+    test_images = int((df_manifest["split"] == "Test").sum())
+
+    annotated_count = int((df_manifest["annotation_status"] == "ANNOTATED").sum())
+    skipped_count = int((df_manifest["annotation_status"] == "SKIPPED").sum())
+    pending_count = int((df_manifest["annotation_status"] == "PENDING").sum())
+
+    train_masks = 0
+    validation_masks = 0
+    test_masks = 0
+
+    valid_image_mask_pairs = 0
+    invalid_masks = 0
+    missing_masks = 0
+    empty_masks = 0
+    wrong_dimensions = 0
+    invalid_pixel_values = 0
+    missing_expected_class = 0
+
+    known_expected_mask_paths = set()
+
+    for _, row in df_manifest.iterrows():
+        img_p = str(row["image_path"])
+        mask_p = str(row["expected_mask_path"])
+        split = str(row["split"])
+        code = int(row.get("class_code", 0))
+
+        known_expected_mask_paths.add(os.path.normcase(os.path.abspath(mask_p)))
+
+        if os.path.exists(mask_p):
+            if split == "Train":
+                train_masks += 1
+            elif split == "Validation":
+                validation_masks += 1
+            elif split == "Test":
+                test_masks += 1
+
+            is_valid, msg, meta = validate_mask_file(img_p, mask_p, code)
+            if is_valid:
+                valid_image_mask_pairs += 1
+            else:
+                invalid_masks += 1
+                err_code = meta.get("error_code", "")
+                if err_code == "EMPTY_MASK":
+                    empty_masks += 1
+                elif err_code in ("DIMENSION_MISMATCH", "MULTI_CHANNEL_MASK"):
+                    wrong_dimensions += 1
+                elif err_code in ("INVALID_PIXEL_VALUES", "INVALID_DTYPE"):
+                    invalid_pixel_values += 1
+                elif err_code == "MISSING_EXPECTED_CLASS":
+                    missing_expected_class += 1
+        else:
+            if split in ("Train", "Validation"):
+                missing_masks += 1
+
+    masks_total = train_masks + validation_masks + test_masks
+    test_modification_detected = (test_masks > 0)
+
+    # Orphan mask detection: scan Annotations/ directory tree for .png files not in manifest
+    orphan_masks = 0
+    if os.path.exists(annotations_base):
+        for root, _, files in os.walk(annotations_base):
+            for f in files:
+                if f.lower().endswith(".png"):
+                    full_p = os.path.normcase(os.path.abspath(os.path.join(root, f)))
+                    if full_p not in known_expected_mask_paths:
+                        orphan_masks += 1
+
+    required_pairs = train_images + validation_images
+    segmentation_training_ready = (
+        valid_image_mask_pairs == required_pairs
+        and invalid_masks == 0
+        and missing_masks == 0
+        and not test_modification_detected
+        and orphan_masks == 0
+    )
+
+    return {
+        "source_images_total": source_images_total,
+        "train_images": train_images,
+        "validation_images": validation_images,
+        "test_images": test_images,
+        "masks_total": masks_total,
+        "train_masks": train_masks,
+        "validation_masks": validation_masks,
+        "test_masks": test_masks,
+        "valid_image_mask_pairs": valid_image_mask_pairs,
+        "invalid_masks": invalid_masks,
+        "missing_masks": missing_masks,
+        "orphan_masks": orphan_masks,
+        "empty_masks": empty_masks,
+        "wrong_dimensions": wrong_dimensions,
+        "invalid_pixel_values": invalid_pixel_values,
+        "missing_expected_class": missing_expected_class,
+        "annotated_count": annotated_count,
+        "skipped_count": skipped_count,
+        "pending_count": pending_count,
+        "test_modification_detected": test_modification_detected,
+        "segmentation_training_ready": segmentation_training_ready
+    }
+
+
 def audit_segmentation_dataset() -> Dict:
     """
     Performs comprehensive audit of the dataset for segmentation ground-truth masks.
@@ -497,6 +624,7 @@ def audit_segmentation_dataset() -> Dict:
     initialize_annotation_directories()
     df_manifest = build_segmentation_annotation_manifest()
     leakage_info = check_dataset_leakage()
+    readiness_info = check_segmentation_readiness()
 
     base_dir = Config.get_base_dir()
     seg_dir = Config.get_segmentation_dir()
@@ -526,7 +654,6 @@ def audit_segmentation_dataset() -> Dict:
             continue
         for root, _, files in os.walk(s_dir):
             abs_root = os.path.abspath(root)
-            # Exclude Annotations, Documentation, Logs, and Experiments from external mask search
             if (abs_root.startswith(annotations_base) or
                 abs_root.startswith(doc_base) or
                 abs_root.startswith(logs_base) or
@@ -540,19 +667,15 @@ def audit_segmentation_dataset() -> Dict:
                 if any(kw in f_lower for kw in ["mask", "_seg", "polygon", "labelme"]):
                     discovered_mask_files.append(os.path.join(root, file))
 
-    manual_annotated_cnt = int((df_manifest["annotation_status"] == "ANNOTATED").sum())
-    manual_passed_cnt = int((df_manifest["validation_status"] == "PASSED").sum())
-    total_images = len(df_manifest)
-
-    # External pre-existing dataset ground-truth availability is determined ONLY by external discovered mask count.
-    # Manual annotation workspace progress (Experiments/Segmentation/Annotations/) MUST NOT determine external dataset audit status.
+    total_images = readiness_info["source_images_total"]
     external_valid_masks = len(discovered_mask_files)
+    effective_valid_pairs = readiness_info["valid_image_mask_pairs"]
 
-    if external_valid_masks > 0:
+    if external_valid_masks > 0 or effective_valid_pairs > 0:
         audit_status = "GROUND_TRUTH_MASKS_AVAILABLE"
-        seg_possible = True
-        audit_wording = f"Discovered {external_valid_masks} valid external ground-truth segmentation masks."
-        num_valid_pairs = external_valid_masks
+        seg_possible = readiness_info["segmentation_training_ready"]
+        audit_wording = f"Discovered {external_valid_masks} external masks and {effective_valid_pairs} valid manual annotation masks."
+        num_valid_pairs = max(external_valid_masks, effective_valid_pairs)
     else:
         audit_status = "GROUND_TRUTH_MASKS_NOT_FOUND"
         seg_possible = False
@@ -564,17 +687,28 @@ def audit_segmentation_dataset() -> Dict:
         "audit_status": audit_status,
         "audit_decision_wording": audit_wording,
         "segmentation_dataset_found": seg_possible,
-        "number_of_source_images": total_images,
-        "number_of_discovered_mask_files": external_valid_masks,
-        "number_of_masks": external_valid_masks,
-        "number_of_valid_image_mask_pairs": num_valid_pairs,
-        "number_of_missing_masks": total_images - num_valid_pairs,
-        "number_of_invalid_masks": 0,
-        "manual_annotation_workspace_progress": {
-            "manual_annotations_created": manual_annotated_cnt,
-            "manual_annotations_passed": manual_passed_cnt
-        },
-        "mask_format": "Single-channel 8-bit uint8 PNG (0=Background, 1=Aphids, 2=Leaf miner, 3=TMB, 4=Leaf blight)" if seg_possible else "N/A (Pending manual ground-truth annotation)",
+        "source_images_total": total_images,
+        "train_images": readiness_info["train_images"],
+        "validation_images": readiness_info["validation_images"],
+        "test_images": readiness_info["test_images"],
+        "masks_total": readiness_info["masks_total"] + external_valid_masks,
+        "train_masks": readiness_info["train_masks"],
+        "validation_masks": readiness_info["validation_masks"],
+        "test_masks": readiness_info["test_masks"],
+        "valid_image_mask_pairs": num_valid_pairs,
+        "invalid_masks": readiness_info["invalid_masks"],
+        "missing_masks": readiness_info["missing_masks"],
+        "orphan_masks": readiness_info["orphan_masks"],
+        "empty_masks": readiness_info["empty_masks"],
+        "wrong_dimensions": readiness_info["wrong_dimensions"],
+        "invalid_pixel_values": readiness_info["invalid_pixel_values"],
+        "missing_expected_class": readiness_info["missing_expected_class"],
+        "annotated_count": readiness_info["annotated_count"],
+        "skipped_count": readiness_info["skipped_count"],
+        "pending_count": readiness_info["pending_count"],
+        "test_modification_detected": readiness_info["test_modification_detected"],
+        "segmentation_training_ready": seg_possible,
+        "mask_format": "Single-channel 8-bit uint8 PNG (0=Background, 1=Aphids, 2=Leaf miner, 3=TMB, 4=Leaf blight)",
         "mask_type": "Semantic Segmentation Lesion Index Masks",
         "train_validation_test_compatibility": f"Split verified (Train={leakage_info['actual_counts']['Train']}, Val={leakage_info['actual_counts']['Validation']}, Test={leakage_info['actual_counts']['Test']}). Test split remains isolated.",
         "dataset_leakage_detected": leakage_info["has_leakage"],
