@@ -90,16 +90,27 @@ class SegmentationDatasetLoader:
         eligible_total = train_total + val_total
 
         # Filter strictly for validated annotations in eligible splits
-        df_eligible = df[df["split"].isin(ANNOTATABLE_SPLITS)]
+        df_eligible = df[df["split"].isin(ANNOTATABLE_SPLITS)] if "split" in df.columns else pd.DataFrame()
         df_annotated = df_eligible[
             (df_eligible["annotation_status"] == "ANNOTATED")
             & (df_eligible["validation_status"] == "PASSED")
-        ]
+        ] if not df_eligible.empty else pd.DataFrame()
+
+        # Duplicate checks in manifest
+        dup_images = int(df_annotated["image_name"].duplicated().sum()) if not df_annotated.empty and "image_name" in df_annotated.columns else 0
+        dup_paths = int(df_annotated["expected_mask_path"].duplicated().sum()) if not df_annotated.empty and "expected_mask_path" in df_annotated.columns else 0
 
         train_records: List[Dict[str, Any]] = []
         val_records: List[Dict[str, Any]] = []
         invalid_masks: List[Dict[str, Any]] = []
         missing_masks: List[Dict[str, Any]] = []
+
+        per_class_counts: Dict[str, int] = {
+            "Aphids": 0,
+            "Leaf_Miner": 0,
+            "Leaf_Blight": 0,
+            "TMB": 0,
+        }
 
         ann_base = self.storage_root / "Experiments" / "Segmentation" / "Annotations"
         ds_base = self.storage_root / "Dataset" / "Cleaned"
@@ -166,6 +177,9 @@ class SegmentationDatasetLoader:
                 elif split_name == "Validation":
                     val_records.append(record)
 
+                if norm_cls in per_class_counts:
+                    per_class_counts[norm_cls] += 1
+
             except Exception as exc:
                 invalid_masks.append({
                     "image_name": img_name,
@@ -174,6 +188,8 @@ class SegmentationDatasetLoader:
                     "error": str(exc),
                 })
 
+        physical_masks_found = len(train_records) + len(val_records)
+
         self.audit_summary = {
             "total_manifest_rows": total_rows,
             "train_rows": train_total,
@@ -181,10 +197,16 @@ class SegmentationDatasetLoader:
             "test_rows_isolated": test_total,
             "eligible_rows": eligible_total,
             "annotated_passed_total": len(df_annotated),
+            "skipped_count": int((df["annotation_status"] == "SKIPPED").sum()) if "annotation_status" in df.columns else 0,
+            "pending_count": int((df["annotation_status"] == "PENDING").sum()) if "annotation_status" in df.columns else 0,
             "validated_train_samples": len(train_records),
             "validated_val_samples": len(val_records),
+            "physical_masks_found": physical_masks_found,
             "missing_masks_count": len(missing_masks),
             "invalid_masks_count": len(invalid_masks),
+            "duplicate_images_count": dup_images,
+            "duplicate_mask_paths_count": dup_paths,
+            "per_class_validated_counts": per_class_counts,
             "test_split_protected": True,
         }
 
@@ -229,7 +251,6 @@ class SegmentationDatasetLoader:
             raise ImportError("TensorFlow is required to build tf.data.Dataset pipelines.")
 
         if len(records) == 0:
-            # Return empty dataset matching schema
             return tf.data.Dataset.from_tensor_slices((
                 tf.zeros((0, *self.image_size, 3), dtype=tf.float32),
                 tf.zeros((0, *self.image_size, 1), dtype=tf.float32),

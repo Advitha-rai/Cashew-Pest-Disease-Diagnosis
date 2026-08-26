@@ -71,8 +71,8 @@ class SegmentationTrainer:
         if self.model is None:
             self.build_and_compile_model()
 
-        best_model_path = self.experiment_dir / "best_unet_model.keras"
-        csv_log_path = self.experiment_dir / "training_history.csv"
+        best_model_path = self.experiment_dir / "best_segmentation_model.keras"
+        csv_log_path = self.experiment_dir / "training_log.csv"
 
         has_validation = (val_ds is not None and val_steps != 0)
 
@@ -119,7 +119,7 @@ class SegmentationTrainer:
         )
 
         # Save final model
-        final_model_path = self.experiment_dir / "final_unet_model.keras"
+        final_model_path = self.experiment_dir / "final_segmentation_model.keras"
         self.model.save(str(final_model_path))
         print(f"[TRAINER] Final model saved to: {final_model_path}")
 

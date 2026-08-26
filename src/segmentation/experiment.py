@@ -39,7 +39,16 @@ class SegmentationExperimentManager:
             json.dump(audit_summary, f, indent=4)
 
         audit_csv = self.experiment_dir / "dataset_audit.csv"
-        df_audit = pd.DataFrame([audit_summary])
+        # Flatten dictionary for single-row CSV representation
+        flat_audit = {}
+        for k, v in audit_summary.items():
+            if isinstance(v, dict):
+                for sub_k, sub_v in v.items():
+                    flat_audit[f"{k}_{sub_k}"] = sub_v
+            else:
+                flat_audit[k] = v
+
+        df_audit = pd.DataFrame([flat_audit])
         df_audit.to_csv(audit_csv, index=False)
         return audit_json
 
@@ -88,8 +97,15 @@ class SegmentationExperimentManager:
 | **Test Pool (Isolated)** | `{audit_summary.get('test_rows_isolated', 0)}` | **STRICTLY READ-ONLY** |
 | **Validated Train Samples** | `{audit_summary.get('validated_train_samples', 0)}` | Loaded for Training |
 | **Validated Validation Samples**| `{audit_summary.get('validated_val_samples', 0)}` | Loaded for Validation |
+| **Physical Masks Found** | `{audit_summary.get('physical_masks_found', 0)}` | Verified |
 | **Missing Masks** | `{audit_summary.get('missing_masks_count', 0)}` | Filtered |
 | **Invalid Mask Codes** | `{audit_summary.get('invalid_masks_count', 0)}` | Excluded |
+
+### Per-Class Validated Annotations:
+- **Aphids**: `{audit_summary.get('per_class_validated_counts', {}).get('Aphids', 0)}`
+- **Leaf_Miner**: `{audit_summary.get('per_class_validated_counts', {}).get('Leaf_Miner', 0)}`
+- **Leaf_Blight**: `{audit_summary.get('per_class_validated_counts', {}).get('Leaf_Blight', 0)}`
+- **TMB**: `{audit_summary.get('per_class_validated_counts', {}).get('TMB', 0)}`
 
 > {'⚠️ **DATASET SIZE WARNING**: Validated manual annotations count is currently small. This run demonstrates pipeline functionality and training integration.' if dataset_warning else '✅ **DATASET SIZE**: Sufficient sample volume for training.'}
 

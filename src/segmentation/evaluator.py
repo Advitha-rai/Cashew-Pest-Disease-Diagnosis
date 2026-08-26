@@ -71,7 +71,6 @@ class SegmentationEvaluator:
                 rec["class_code"],
             )
 
-            # Model prediction: input batch shape (1, 224, 224, 3)
             pred_raw = self.model.predict(np.expand_dims(img_arr, axis=0), verbose=0)[0]
             pred_bin = (pred_raw >= threshold).astype(np.float32)
 
@@ -126,8 +125,7 @@ class SegmentationEvaluator:
         3. Predicted Binary Mask
         4. Original + Predicted Mask Overlay
         """
-        if plt is None:
-            print("[WARN] matplotlib not available; skipping visualization generation.")
+        if plt is None or len(records) == 0:
             return []
 
         saved_plots = []
@@ -146,7 +144,7 @@ class SegmentationEvaluator:
             # Create RGB Overlay: red lesion overlay on original image
             overlay = img_arr.copy()
             pred_mask_2d = pred_bin[:, :, 0]
-            overlay[pred_mask_2d == 1.0, 0] = np.clip(overlay[pred_mask_2d == 1.0, 0] * 0.5 + 0.5, 0, 1)  # Red tint
+            overlay[pred_mask_2d == 1.0, 0] = np.clip(overlay[pred_mask_2d == 1.0, 0] * 0.5 + 0.5, 0, 1)
 
             fig, axes = plt.subplots(1, 4, figsize=(16, 4))
             fig.suptitle(
@@ -155,22 +153,18 @@ class SegmentationEvaluator:
                 fontweight="bold",
             )
 
-            # 1. Original
             axes[0].imshow(img_arr)
             axes[0].set_title("1. Original Image (224x224)")
             axes[0].axis("off")
 
-            # 2. Ground Truth
             axes[1].imshow(gt_mask[:, :, 0], cmap="gray", vmin=0, vmax=1)
             axes[1].set_title(f"2. Ground Truth ({rec['class_name']})")
             axes[1].axis("off")
 
-            # 3. Predicted
             axes[2].imshow(pred_bin[:, :, 0], cmap="gray", vmin=0, vmax=1)
             axes[2].set_title("3. Predicted Mask (U-Net)")
             axes[2].axis("off")
 
-            # 4. Overlay
             axes[3].imshow(overlay)
             axes[3].set_title("4. Predicted Overlay")
             axes[3].axis("off")
@@ -179,6 +173,12 @@ class SegmentationEvaluator:
             stem = Path(rec["image_name"]).stem
             out_file = self.viz_dir / f"pred_{idx+1:02d}_{stem}.png"
             fig.savefig(str(out_file), dpi=150, bbox_inches="tight")
+
+            # Also save primary prediction_visualizations.png
+            if idx == 0:
+                primary_viz = self.experiment_dir / "prediction_visualizations.png"
+                fig.savefig(str(primary_viz), dpi=150, bbox_inches="tight")
+
             plt.close(fig)
             saved_plots.append(str(out_file))
 

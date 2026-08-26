@@ -15,16 +15,23 @@ from datetime import datetime
 class SegmentationTrainingConfig:
     """Configuration parameters for U-Net lesion segmentation training."""
 
-    # Model architecture
+    # Geometry & Dimensions
     image_height: int = 224
     image_width: int = 224
+    image_size: Tuple[int, int] = (224, 224)
     num_channels: int = 3
+    input_shape: Tuple[int, int, int] = (224, 224, 3)
+    mask_size: Tuple[int, int] = (224, 224)
+    mask_channels: int = 1
+    output_shape: Tuple[int, int, int] = (224, 224, 1)
     num_classes: int = 1  # Binary lesion segmentation (foreground vs background)
+
+    # Architecture Hyperparameters
     encoder_filters: Tuple[int, ...] = (32, 64, 128, 256)
     bottleneck_filters: int = 512
     dropout_rate: float = 0.2
 
-    # Training hyperparameters
+    # Optimization Hyperparameters
     batch_size: int = 4
     learning_rate: float = 1e-4
     num_epochs: int = 30
@@ -40,14 +47,6 @@ class SegmentationTrainingConfig:
 
     # Data policy
     min_samples_warning_threshold: int = 20
-
-    @property
-    def input_shape(self) -> Tuple[int, int, int]:
-        return (self.image_height, self.image_width, self.num_channels)
-
-    @property
-    def output_shape(self) -> Tuple[int, int, int]:
-        return (self.image_height, self.image_width, self.num_classes)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
