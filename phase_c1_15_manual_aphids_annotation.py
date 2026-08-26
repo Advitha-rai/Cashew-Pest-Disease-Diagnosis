@@ -23,7 +23,7 @@ from PIL import Image
 # TARGET IMAGE CONFIGURATION
 # Set the exact filename of the Aphids image you want to annotate:
 # ============================================================
-TARGET_IMAGE = "20220218_124514.jpg"
+TARGET_IMAGE = "149.jpg"
 
 # ------------------------------------------------------------
 # The 10 Canonical Requested Aphids Image Identifiers
