@@ -1,6 +1,6 @@
 """
 Cashew Pest and Disease Diagnosis System
-Phase C.1.15 — Production Single-Image Manual Aphids Segmentation Tool
+Phase C.1.15 — Dedicated Single-Image TMB Manual Annotation Tool
 Framework: TensorFlow / Keras (Google Colab / Jupyter Canvas UI)
 """
 
@@ -21,25 +21,17 @@ from PIL import Image
 
 # ============================================================
 # TARGET IMAGE CONFIGURATION
-# Set the exact filename of the Aphids image you want to annotate:
+# Set the exact filename of the TMB image you want to annotate:
 # ============================================================
-TARGET_IMAGE = "20220311_161838.jpg"
+TARGET_IMAGE = ""
 
 # ------------------------------------------------------------
-# The 10 Canonical Requested Aphids Image Identifiers
+# Canonical Class Specifications for TMB (Tea Mosquito Bug)
 # ------------------------------------------------------------
-REQUESTED_APHIDS_MAP = {
-    "20220218_124514": "20220218_124514.jpg",
-    "149": "149.jpg",
-    "20220311_161838": "20220311_161838.jpg",
-    "20220815_145343": "20220815_145343.jpg",
-    "aphid (2)": "aphid (2).jpg",
-    "Aphid1": "Aphid1.jpg",
-    "Aphids on nuts 5": "Aphids on nuts 5.jpg",
-    "Aphids on nuts 18": "Aphids on nuts 18.jpg",
-    "SAM_2225": "SAM_2225.jpg",
-    "SAM_0994": "SAM_0994.jpg",
-}
+TOOL_CLASS_NAME = "TMB"
+TOOL_CLASS_CODE = 4
+DATASET_SUBFOLDER = "TMB"
+ANNOTATION_SUBFOLDER = "TMB"
 
 # ---------------------------------------------------------
 # Dynamic Environment & Path Discovery
@@ -81,21 +73,24 @@ def resolve_and_validate_target(
 ) -> Tuple[Optional[Path], Optional[Dict[str, Any]], str, bool]:
     """
     Resolves TARGET_IMAGE and strictly validates:
-    - Image exists in Dataset/Cleaned/Aphids
-    - Class is Aphids (Code 1)
+    - Image exists in Dataset/Cleaned/TMB
+    - Class is TMB (Code 4)
     - Split is Train (not Test)
     - Manifest row exists
     - Image is not already ANNOTATED
     """
+    if not target_name or not target_name.strip():
+        return None, None, "TARGET_IMAGE is empty. Please set TARGET_IMAGE at the top of the script.", False
+
     clean_target = target_name.strip()
     target_stem = Path(clean_target).stem.lower()
 
-    # Search Dataset/Cleaned/Aphids
+    # Search Dataset/Cleaned/TMB
     possible_ds_dirs = [
-        DRIVE_ROOT / "Dataset" / "Cleaned" / "Aphids",
-        REPO_ROOT / "Dataset" / "Cleaned" / "Aphids",
-        DATASET_DIR / "Aphids" if DATASET_DIR.name != "Aphids" else DATASET_DIR,
-        Path.cwd() / "Dataset" / "Cleaned" / "Aphids",
+        DRIVE_ROOT / "Dataset" / "Cleaned" / DATASET_SUBFOLDER,
+        REPO_ROOT / "Dataset" / "Cleaned" / DATASET_SUBFOLDER,
+        DATASET_DIR / DATASET_SUBFOLDER if DATASET_DIR.name != DATASET_SUBFOLDER else DATASET_DIR,
+        Path.cwd() / "Dataset" / "Cleaned" / DATASET_SUBFOLDER,
     ]
 
     found_img_path = None
@@ -151,8 +146,8 @@ def resolve_and_validate_target(
     if split != "Train":
         return None, None, f"REJECTION: Image '{clean_target}' is in split '{split}', expected 'Train'!", False
 
-    if norm_cls != "Aphids":
-        return None, None, f"REJECTION: Image '{clean_target}' belongs to class '{norm_cls}', expected 'Aphids'!", False
+    if norm_cls != TOOL_CLASS_NAME:
+        return None, None, f"REJECTION: Image '{clean_target}' belongs to class '{norm_cls}', expected '{TOOL_CLASS_NAME}'!", False
 
     # Duplicate / Already-Annotated Protection
     ann_status = str(row.get("annotation_status", ""))
@@ -163,29 +158,28 @@ def resolve_and_validate_target(
     # Check if physical mask exists while manifest says PENDING
     exp_mask = Path(str(row.get("expected_mask_path", "")))
     if not exp_mask.exists():
-        ann_base = manifest_path.parent / "Annotations" / "Train" / "Aphids"
+        ann_base = manifest_path.parent / "Annotations" / "Train" / ANNOTATION_SUBFOLDER
         exp_mask = ann_base / f"{Path(clean_target).stem}_mask.png"
 
     if exp_mask.exists() and ann_status == "PENDING":
         return found_img_path, row, f"INCONSISTENCY DETECTED: Physical mask exists at '{exp_mask}' but manifest status is PENDING. Stopped safely.", False
 
     resolved_name = found_img_path.name if found_img_path else row.get("image_name", clean_target)
-    return found_img_path, row, f"Resolved '{resolved_name}' [Train | Aphids | PENDING]", True
+    return found_img_path, row, f"Resolved '{resolved_name}' [Train | {TOOL_CLASS_NAME} | PENDING]", True
 
 
 # ---------------------------------------------------------
 # 2. Interactive Single-Image Drawing UI (Save Annotation ONLY)
 # ---------------------------------------------------------
-def build_single_aphids_ui(
+def build_single_tmb_ui(
     img_name: str,
     img_path: Optional[Path],
     manifest_record: Dict[str, Any],
     manifest_path: Path,
 ) -> str:
     """
-    Builds the dedicated single-image Aphids manual segmentation interface.
-    Contains exactly ONE action button: SAVE ANNOTATION.
-    NO Next, NO Skip, NO Previous, NO automatic queue.
+    Builds the dedicated single-image TMB manual segmentation interface.
+    Features ONLY 'SAVE ANNOTATION'. NO Next, NO Skip, NO Previous, NO queue.
     """
     img_b64 = ""
     if img_path and img_path.exists():
@@ -196,18 +190,18 @@ def build_single_aphids_ui(
     img_name_json = json.dumps(img_name)
 
     html_code = f"""
-<div id="aphids-manual-container" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 840px; margin: 15px auto; background: #FFFFFF; padding: 20px; border-radius: 10px; border: 2px solid #28A745; box-shadow: 0 4px 14px rgba(0,0,0,0.12);">
+<div id="tmb-manual-container" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 840px; margin: 15px auto; background: #FFFFFF; padding: 20px; border-radius: 10px; border: 2px solid #FFC107; box-shadow: 0 4px 14px rgba(0,0,0,0.12);">
     
     <!-- Title Banner -->
-    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #28A745; padding-bottom: 12px; margin-bottom: 14px;">
-        <h3 style="margin: 0; color: #155724; font-size: 19px; font-weight: bold;">🌿 Manual Aphids Segmentation Tool — Phase C.1.15</h3>
-        <span style="background: #28A745; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold;">Class: Aphids (Code 1)</span>
+    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #FFC107; padding-bottom: 12px; margin-bottom: 14px;">
+        <h3 style="margin: 0; color: #856404; font-size: 19px; font-weight: bold;">🌿 Manual TMB Segmentation Tool — Phase C.1.15</h3>
+        <span style="background: #FFC107; color: #212529; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold;">Class: TMB (Code 4)</span>
     </div>
 
     <!-- Target Image Details Card -->
-    <div style="background: #F8F9FA; padding: 12px 16px; border: 1px solid #CED4DA; border-radius: 6px; margin-bottom: 14px; font-size: 13px; display: flex; flex-wrap: wrap; gap: 18px;">
-        <div><strong>Target File:</strong> <span style="color: #155724; font-weight: bold;">{img_name}</span></div>
-        <div><strong>Class:</strong> <span style="color: #DC3545; font-weight: bold;">Aphids</span> (Code: 1)</div>
+    <div style="background: #FFF3CD; padding: 12px 16px; border: 1px solid #FFEBAA; border-radius: 6px; margin-bottom: 14px; font-size: 13px; display: flex; flex-wrap: wrap; gap: 18px;">
+        <div><strong>Target File:</strong> <span style="color: #856404; font-weight: bold;">{img_name}</span></div>
+        <div><strong>Class:</strong> <span style="color: #856404; font-weight: bold;">TMB</span> (Code: 4)</div>
         <div><strong>Split:</strong> <span style="color: #007BFF; font-weight: bold;">Train</span></div>
         <div><strong>Resolution:</strong> <span>224 × 224</span></div>
         <div><strong>Status:</strong> <span id="lbl-status" style="font-weight: bold; color: #6C757D;">PENDING</span></div>
@@ -215,7 +209,7 @@ def build_single_aphids_ui(
 
     <!-- Drawing Toolbar -->
     <div style="margin-bottom: 14px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; background: #E9ECEF; padding: 10px 14px; border-radius: 6px;">
-        <button onclick="setDrawingMode('brush')" id="btn-brush" style="background: #DC3545; color: white; border: none; padding: 7px 16px; border-radius: 4px; font-weight: bold; cursor: pointer;">🖌️ Paint Aphids (Red)</button>
+        <button onclick="setDrawingMode('brush')" id="btn-brush" style="background: #FFC107; color: #212529; border: none; padding: 7px 16px; border-radius: 4px; font-weight: bold; cursor: pointer;">🖌️ Paint TMB Lesions (Yellow)</button>
         <button onclick="setDrawingMode('eraser')" id="btn-eraser" style="background: #6C757D; color: white; border: none; padding: 7px 16px; border-radius: 4px; font-weight: bold; cursor: pointer; opacity: 0.6;">🧹 Eraser</button>
         
         <div style="display: flex; align-items: center; gap: 6px; margin-left: 8px;">
@@ -232,14 +226,14 @@ def build_single_aphids_ui(
     </div>
 
     <!-- Dual Canvas Work Area (224x224 scaled to 448x448 for drawing precision) -->
-    <div id="canvas-wrapper" style="position: relative; width: 448px; height: 448px; border: 2px solid #28A745; margin: 0 auto; background: #000; overflow: hidden; border-radius: 4px;">
+    <div id="canvas-wrapper" style="position: relative; width: 448px; height: 448px; border: 2px solid #FFC107; margin: 0 auto; background: #000; overflow: hidden; border-radius: 4px;">
         <img id="bg-img" src="data:image/jpeg;base64,{img_b64}" style="position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1; object-fit: contain;">
         <canvas id="display-canvas" width="224" height="224" style="position: absolute; left: 0; top: 0; width: 100%; height: 100%; z-index: 2; pointer-events: auto; touch-action: none; cursor: crosshair;"></canvas>
     </div>
 
     <!-- Action Bar: EXACTLY ONE BUTTON (SAVE ANNOTATION) -->
     <div style="margin-top: 16px; display: flex; justify-content: space-between; align-items: center; gap: 14px;">
-        <div id="status-msg" style="font-weight: bold; color: #155724; font-size: 13px;">Ready: Paint visible aphids clusters on the leaf and click SAVE ANNOTATION.</div>
+        <div id="status-msg" style="font-weight: bold; color: #856404; font-size: 13px;">Ready: Paint visible Tea Mosquito Bug feeding punctures/lesions and click SAVE ANNOTATION.</div>
         <button onclick="saveAnnotation()" id="btn-save" style="background: #28A745; color: white; border: none; padding: 11px 26px; border-radius: 6px; font-size: 14px; font-weight: bold; cursor: pointer; box-shadow: 0 3px 8px rgba(0,0,0,0.18);">💾 SAVE ANNOTATION</button>
     </div>
 </div>
@@ -248,6 +242,7 @@ def build_single_aphids_ui(
 (function() {{
     var imageName = {img_name_json};
     var manifestPath = {manifest_json};
+    var targetCode = 4;
 
     var displayCanvas = document.getElementById("display-canvas");
     var displayCtx = displayCanvas.getContext("2d");
@@ -352,8 +347,8 @@ def build_single_aphids_ui(
 
         if (mode === 'brush') {{
             maskCtx.globalCompositeOperation = 'source-over';
-            maskCtx.fillStyle = 'rgb(1,1,1)';
-            maskCtx.strokeStyle = 'rgb(1,1,1)';
+            maskCtx.fillStyle = 'rgb(' + targetCode + ',' + targetCode + ',' + targetCode + ')';
+            maskCtx.strokeStyle = maskCtx.fillStyle;
 
             maskCtx.beginPath();
             maskCtx.moveTo(lastPos.x, lastPos.y);
@@ -392,9 +387,10 @@ def build_single_aphids_ui(
             var r = src[i];
             var a = src[i + 3];
             if (a > 0 && r > 0) {{
-                dst[i] = 220;
-                dst[i+1] = 53;
-                dst[i+2] = 69;
+                // TMB -> Yellow/Gold overlay
+                dst[i] = 255;
+                dst[i+1] = 193;
+                dst[i+2] = 7;
                 dst[i+3] = 180;
             }}
         }}
@@ -408,7 +404,7 @@ def build_single_aphids_ui(
         btn.innerText = "Saving & Validating...";
 
         if (window.google && google.colab && google.colab.kernel) {{
-            google.colab.kernel.invokeFunction('colab_save_manual_aphids_mask', [imageName, b64Data, manifestPath], {{}})
+            google.colab.kernel.invokeFunction('colab_save_manual_tmb_mask', [imageName, b64Data, manifestPath], {{}})
                 .then(function(res) {{
                     btn.disabled = false;
                     btn.innerText = "💾 SAVE ANNOTATION";
@@ -434,7 +430,7 @@ def build_single_aphids_ui(
         }} else {{
             btn.disabled = false;
             btn.innerText = "💾 SAVE ANNOTATION";
-            document.getElementById("status-msg").innerText = "✅ [Standalone Preview Mode] Validated Aphids Mask with Code {0, 1}.";
+            document.getElementById("status-msg").innerText = "✅ [Standalone Preview Mode] Validated TMB Mask with Code {0, 4}.";
             document.getElementById("status-msg").style.color = "#28A745";
         }}
     }};
@@ -447,10 +443,10 @@ def build_single_aphids_ui(
 # ---------------------------------------------------------
 # 3. Backend Save Handler & Strict Validation
 # ---------------------------------------------------------
-def colab_save_manual_aphids_mask_handler(image_name: str, mask_base64: str, manifest_csv: str) -> Dict[str, Any]:
+def colab_save_manual_tmb_mask_handler(image_name: str, mask_base64: str, manifest_csv: str) -> Dict[str, Any]:
     """
-    Saves and strictly validates the manually drawn Aphids mask.
-    Enforces foreground value == 1, background == 0, uint8 dtype, mode L, size 224x224.
+    Saves and strictly validates the manually drawn TMB mask.
+    Enforces foreground value == 4, background == 0, uint8 dtype, mode L, size 224x224.
     Updates only that image's manifest row and creates a timestamped backup before writing.
     """
     manifest_path = Path(manifest_csv)
@@ -495,23 +491,23 @@ def colab_save_manual_aphids_mask_handler(image_name: str, mask_base64: str, man
     if fg_pixels == 0:
         return {"success": False, "message": "Validation Rejected: Mask is completely empty! Please paint lesion pixels."}
 
-    # Convert foreground to Aphids code = 1
-    mask_arr = (mask_arr > 0).astype(np.uint8) * 1
+    # Convert foreground to TMB code = 4
+    mask_arr = (mask_arr > 0).astype(np.uint8) * TOOL_CLASS_CODE
 
     img_path = Path(str(row.get("image_path", "")))
-    is_valid, msg, meta = validate_mask_array(img_path, mask_arr, expected_class_code=1)
+    is_valid, msg, meta = validate_mask_array(img_path, mask_arr, expected_class_code=TOOL_CLASS_CODE)
 
     if not is_valid:
         return {"success": False, "message": f"Validation Rejected: {msg}"}
 
     # 1. Create Timestamped Backup of Manifest
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_dir = manifest_path.parent / "backup_previous" / f"phase_c1_15_manual_aphids_{timestamp_str}"
+    backup_dir = manifest_path.parent / "backup_previous" / f"phase_c1_15_manual_tmb_{timestamp_str}"
     backup_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(manifest_path, backup_dir / "segmentation_annotation_manifest_pre_save.csv")
 
     # 2. Save Mask Atomically to Disk
-    ann_base = manifest_path.parent / "Annotations" / "Train" / "Aphids"
+    ann_base = manifest_path.parent / "Annotations" / "Train" / ANNOTATION_SUBFOLDER
     ann_base.mkdir(parents=True, exist_ok=True)
     mask_stem = Path(image_name).stem
     out_mask_path = ann_base / f"{mask_stem}_mask.png"
@@ -532,8 +528,8 @@ def colab_save_manual_aphids_mask_handler(image_name: str, mask_base64: str, man
     assert reloaded_mode == "L", f"Invalid mode: {reloaded_mode}"
     assert reloaded_size == (224, 224), f"Invalid size: {reloaded_size}"
     assert reloaded_dtype == np.uint8, f"Invalid dtype: {reloaded_dtype}"
-    assert reloaded_vals.issubset({0, 1}), f"Invalid mask values: {reloaded_vals}"
-    assert 1 in reloaded_vals, "Saved mask has no foreground pixels with value 1!"
+    assert reloaded_vals.issubset({0, TOOL_CLASS_CODE}), f"Invalid mask values: {reloaded_vals}"
+    assert TOOL_CLASS_CODE in reloaded_vals, f"Saved mask has no foreground pixels with value {TOOL_CLASS_CODE}!"
 
     # 4. Compute SHA256
     sha256 = hashlib.sha256()
@@ -545,8 +541,8 @@ def colab_save_manual_aphids_mask_handler(image_name: str, mask_base64: str, man
     idx = matching.index[0]
     df_man.at[idx, "annotation_status"] = "ANNOTATED"
     df_man.at[idx, "validation_status"] = "PASSED"
-    df_man.at[idx, "class_name"] = "Aphids"
-    df_man.at[idx, "class_code"] = 1
+    df_man.at[idx, "class_name"] = TOOL_CLASS_NAME
+    df_man.at[idx, "class_code"] = TOOL_CLASS_CODE
     df_man.at[idx, "split"] = "Train"
     df_man.at[idx, "expected_mask_path"] = str(out_mask_path)
     df_man.at[idx, "error_message"] = ""
@@ -562,8 +558,8 @@ def colab_save_manual_aphids_mask_handler(image_name: str, mask_base64: str, man
     print("ANNOTATION SAVED SUCCESSFULLY")
     print("============================================================")
     print(f"Image            : {image_name}")
-    print(f"Class            : Aphids")
-    print(f"Class Code       : 1")
+    print(f"Class            : {TOOL_CLASS_NAME}")
+    print(f"Class Code       : {TOOL_CLASS_CODE}")
     print(f"Mask             : {out_mask_path}")
     print(f"Unique Values    : {sorted(list(reloaded_vals))}")
     print(f"Geometry         : 224 x 224")
@@ -577,10 +573,10 @@ def colab_save_manual_aphids_mask_handler(image_name: str, mask_base64: str, man
     print(f"  Validation Images   : {prog.get('val_images', 860)}")
     print(f"  Test Images         : {prog.get('test_images_isolated', 861)}")
     print(f"  Eligible Images     : {prog.get('total_eligible_images', 4873)}")
-    print(f"  Annotated           : {prog.get('annotated_count', 1)}")
-    print(f"  Skipped             : {prog.get('skipped_count', 1)}")
-    print(f"  Pending             : {prog.get('pending_count', 4871)}")
-    print(f"  Passed              : {prog.get('passed_validation_count', 1)}")
+    print(f"  Annotated           : {prog.get('annotated_count', 0)}")
+    print(f"  Skipped             : {prog.get('skipped_count', 0)}")
+    print(f"  Pending             : {prog.get('pending_count', 4873)}")
+    print(f"  Passed              : {prog.get('passed_validation_count', 0)}")
     print(f"  Failed              : {prog.get('failed_validation_count', 0)}")
     print(f"  Test Protection     : {prog.get('test_set_isolation_status', 'STRICTLY_READ_ONLY')}")
     print("============================================================\n")
@@ -598,7 +594,7 @@ def register_colab_callbacks():
     """Registers the dedicated single-image Colab callback."""
     try:
         from google.colab import output
-        output.register_callback("colab_save_manual_aphids_mask", colab_save_manual_aphids_mask_handler)
+        output.register_callback("colab_save_manual_tmb_mask", colab_save_manual_tmb_mask_handler)
         return True
     except Exception:
         return False
@@ -609,11 +605,12 @@ def register_colab_callbacks():
 # ---------------------------------------------------------
 def main():
     print("============================================================")
-    print("PHASE C.1.15 — MANUAL APHIDS SEGMENTATION TOOL")
+    print("PHASE C.1.15 — MANUAL TMB SEGMENTATION TOOL")
     print("============================================================")
     print(f"Repository Root         : {REPO_ROOT}")
     print(f"Drive Root              : {DRIVE_ROOT}")
-    print(f"Configured Target Image : {TARGET_IMAGE}")
+    print(f"Target Class            : {TOOL_CLASS_NAME} (Code: {TOOL_CLASS_CODE})")
+    print(f"Configured Target Image : {TARGET_IMAGE if TARGET_IMAGE else '[NOT SET - Please edit TARGET_IMAGE at top of script]'}")
 
     manifest_candidates = [
         DRIVE_ROOT / "Experiments" / "Segmentation" / "segmentation_annotation_manifest.csv",
@@ -628,6 +625,10 @@ def main():
 
     if manifest_path is None:
         manifest_path = CANONICAL_MANIFEST
+
+    if not TARGET_IMAGE:
+        print("\n[ACTION REQUIRED]: Open phase_c1_15_manual_tmb_annotation.py, enter TARGET_IMAGE, and rerun.")
+        return
 
     # Step 1: Resolve and Validate Target Image
     img_path, record, msg, is_valid_target = resolve_and_validate_target(TARGET_IMAGE, manifest_path)
@@ -649,7 +650,7 @@ def main():
     # Display Canvas UI in Colab / Jupyter
     try:
         from IPython.display import HTML, display
-        ui_html = build_single_aphids_ui(
+        ui_html = build_single_tmb_ui(
             img_name=TARGET_IMAGE,
             img_path=img_path,
             manifest_record=record,
