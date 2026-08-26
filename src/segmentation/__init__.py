@@ -115,4 +115,23 @@ __all__ = [
     "get_annotation_progress",
     "colab_save_mask_handler",
     "colab_skip_image_handler",
+    "SegmentationTrainingConfig",
+    "get_experiment_dir",
+    "SegmentationDatasetLoader",
+    "build_unet",
+    "dice_coef",
+    "dice_loss",
+    "iou_metric",
+    "bce_dice_loss",
+    "SegmentationTrainer",
+    "SegmentationEvaluator",
+    "SegmentationExperimentManager",
 ]
+
+# Phase C.2 Training API
+from .training_config import SegmentationTrainingConfig, get_experiment_dir
+from .data_loader import SegmentationDatasetLoader
+from .unet_model import build_unet, dice_coef, dice_loss, iou_metric, bce_dice_loss
+from .trainer import SegmentationTrainer
+from .evaluator import SegmentationEvaluator
+from .experiment import SegmentationExperimentManager
