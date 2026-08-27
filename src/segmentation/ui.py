@@ -304,6 +304,24 @@ def build_annotation_html(
     }}
 
     function getRawMaskBase64() {{
+        var data = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height).data;
+        var nonZero = 0;
+        var maxValue = 0;
+
+        for (var i = 0; i < data.length; i += 4) {{
+            if (data[i] > 0 || data[i + 1] > 0 || data[i + 2] > 0 || data[i + 3] > 0) {{
+                nonZero++;
+            }}
+            maxValue = Math.max(maxValue, data[i], data[i + 1], data[i + 2], data[i + 3]);
+        }}
+
+        console.log("MASK DEBUG:", {{
+            width: maskCanvas.width,
+            height: maskCanvas.height,
+            nonZeroPixels: nonZero,
+            maxValue: maxValue
+        }});
+
         return maskCanvas.toDataURL('image/png');
     }}
 

@@ -82,6 +82,11 @@ def process_annotation_submission(
     else:
         return False, "Invalid mask input type.", {"error_code": "INVALID_INPUT"}
 
+    # Diagnostic print / verification
+    non_zero_pixels = int(np.count_nonzero(mask_arr))
+    unique_vals = sorted([int(v) for v in np.unique(mask_arr)])
+    print(f"[BACKEND DECODE DEBUG] Image: {img_path.name} | Shape: {mask_arr.shape} | Dtype: {mask_arr.dtype} | Min: {int(np.min(mask_arr))} | Max: {int(np.max(mask_arr))} | NonZero: {non_zero_pixels} | Unique: {unique_vals}")
+
     # 3. Validate array
     is_valid, val_msg, val_meta = validate_mask_array(img_path, mask_arr, code)
     if not is_valid:
@@ -145,11 +150,14 @@ def process_annotation_submission(
         except Exception:
             pass
 
-    return True, "Annotation successfully validated and saved.", {
+    return True, f"Annotation successfully validated and saved. (Unique: {unique_vals}, Foreground: {non_zero_pixels}px)", {
         "mask_path": str(target_mask_path),
         "mask_sha256": mask_hash,
         "progress": progress,
-        "next_item": next_item
+        "next_item": next_item,
+        "unique_values": unique_vals,
+        "foreground_pixels": non_zero_pixels,
+        "class_code": code,
     }
 
 
@@ -220,7 +228,10 @@ def colab_save_mask_handler(
         "success": success,
         "message": msg,
         "progress": data.get("progress", {}),
-        "next_item": data.get("next_item")
+        "next_item": data.get("next_item"),
+        "unique_values": data.get("unique_values", []),
+        "foreground_pixels": data.get("foreground_pixels", 0),
+        "class_code": data.get("class_code", 0),
     })
 
 
