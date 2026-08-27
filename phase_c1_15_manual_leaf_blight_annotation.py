@@ -20,18 +20,14 @@ import pandas as pd
 from PIL import Image
 
 # ============================================================
-# TARGET IMAGE CONFIGURATION
-# Set the exact filename of the Leaf_Blight image you want to annotate:
+# REQUIRED CLASS & TARGET CONFIGURATION (DEFINED AT TOP OF FILE)
 # ============================================================
 TARGET_IMAGE = ""
 
-# ------------------------------------------------------------
-# Canonical Class Specifications for Leaf_Blight
-# ------------------------------------------------------------
 TOOL_CLASS_NAME = "Leaf_Blight"
 TOOL_CLASS_CODE = 3
-DATASET_SUBFOLDER = "Leaf blight"
-ANNOTATION_SUBFOLDER = "Leaf_blight"
+DATASET_CLASS_FOLDER = "Leaf blight"
+ANNOTATION_CLASS_FOLDER = "Leaf_blight"
 
 # ---------------------------------------------------------
 # Dynamic Environment & Path Discovery
@@ -87,12 +83,12 @@ def resolve_and_validate_target(
 
     # Search Dataset/Cleaned/Leaf blight
     possible_ds_dirs = [
-        DRIVE_ROOT / "Dataset" / "Cleaned" / DATASET_SUBFOLDER,
+        DRIVE_ROOT / "Dataset" / "Cleaned" / DATASET_CLASS_FOLDER,
         DRIVE_ROOT / "Dataset" / "Cleaned" / "Leaf_blight",
-        REPO_ROOT / "Dataset" / "Cleaned" / DATASET_SUBFOLDER,
+        REPO_ROOT / "Dataset" / "Cleaned" / DATASET_CLASS_FOLDER,
         REPO_ROOT / "Dataset" / "Cleaned" / "Leaf_blight",
-        DATASET_DIR / DATASET_SUBFOLDER if DATASET_DIR.name != DATASET_SUBFOLDER else DATASET_DIR,
-        Path.cwd() / "Dataset" / "Cleaned" / DATASET_SUBFOLDER,
+        DATASET_DIR / DATASET_CLASS_FOLDER if DATASET_DIR.name != DATASET_CLASS_FOLDER else DATASET_DIR,
+        Path.cwd() / "Dataset" / "Cleaned" / DATASET_CLASS_FOLDER,
     ]
 
     found_img_path = None
@@ -160,7 +156,7 @@ def resolve_and_validate_target(
     # Check if physical mask exists while manifest says PENDING
     exp_mask = Path(str(row.get("expected_mask_path", "")))
     if not exp_mask.exists():
-        ann_base = manifest_path.parent / "Annotations" / "Train" / ANNOTATION_SUBFOLDER
+        ann_base = manifest_path.parent / "Annotations" / "Train" / ANNOTATION_CLASS_FOLDER
         exp_mask = ann_base / f"{Path(clean_target).stem}_mask.png"
 
     if exp_mask.exists() and ann_status == "PENDING":
@@ -197,13 +193,13 @@ def build_single_leaf_blight_ui(
     <!-- Title Banner -->
     <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #007BFF; padding-bottom: 12px; margin-bottom: 14px;">
         <h3 style="margin: 0; color: #004085; font-size: 19px; font-weight: bold;">🌿 Manual Leaf_Blight Segmentation Tool — Phase C.1.15</h3>
-        <span style="background: #007BFF; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold;">Class: Leaf_Blight (Code 3)</span>
+        <span style="background: #007BFF; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold;">Class: {TOOL_CLASS_NAME} (Code {TOOL_CLASS_CODE})</span>
     </div>
 
     <!-- Target Image Details Card -->
     <div style="background: #F8F9FA; padding: 12px 16px; border: 1px solid #CED4DA; border-radius: 6px; margin-bottom: 14px; font-size: 13px; display: flex; flex-wrap: wrap; gap: 18px;">
         <div><strong>Target File:</strong> <span style="color: #004085; font-weight: bold;">{img_name}</span></div>
-        <div><strong>Class:</strong> <span style="color: #007BFF; font-weight: bold;">Leaf_Blight</span> (Code: 3)</div>
+        <div><strong>Class:</strong> <span style="color: #007BFF; font-weight: bold;">{TOOL_CLASS_NAME}</span> (Code: {TOOL_CLASS_CODE})</div>
         <div><strong>Split:</strong> <span style="color: #007BFF; font-weight: bold;">Train</span></div>
         <div><strong>Resolution:</strong> <span>224 × 224</span></div>
         <div><strong>Status:</strong> <span id="lbl-status" style="font-weight: bold; color: #6C757D;">PENDING</span></div>
@@ -244,7 +240,7 @@ def build_single_leaf_blight_ui(
 (function() {{
     var imageName = {img_name_json};
     var manifestPath = {manifest_json};
-    var targetCode = 3;
+    var targetCode = {TOOL_CLASS_CODE};
 
     var displayCanvas = document.getElementById("display-canvas");
     var displayCtx = displayCanvas.getContext("2d");
@@ -432,7 +428,7 @@ def build_single_leaf_blight_ui(
         }} else {{
             btn.disabled = false;
             btn.innerText = "💾 SAVE ANNOTATION";
-            document.getElementById("status-msg").innerText = "✅ [Standalone Preview Mode] Validated Leaf_Blight Mask with Code {0, 3}.";
+            document.getElementById("status-msg").innerText = "✅ [Standalone Preview Mode] Validated Leaf_Blight Mask with Code {{0, {TOOL_CLASS_CODE}}}.";
             document.getElementById("status-msg").style.color = "#28A745";
         }}
     }};
@@ -509,7 +505,7 @@ def colab_save_manual_leaf_blight_mask_handler(image_name: str, mask_base64: str
     shutil.copy2(manifest_path, backup_dir / "segmentation_annotation_manifest_pre_save.csv")
 
     # 2. Save Mask Atomically to Disk
-    ann_base = manifest_path.parent / "Annotations" / "Train" / ANNOTATION_SUBFOLDER
+    ann_base = manifest_path.parent / "Annotations" / "Train" / ANNOTATION_CLASS_FOLDER
     ann_base.mkdir(parents=True, exist_ok=True)
     mask_stem = Path(image_name).stem
     out_mask_path = ann_base / f"{mask_stem}_mask.png"
