@@ -87,7 +87,10 @@ def build_keras_model(
     inputs = keras.Input(shape=input_shape, name="input_image")
     
     # Pass inputs through backbone
-    x = base_model(inputs, training=trainable_backbone)
+    if model_name_key == "mobilenet_v3_large":
+        x = base_model(inputs, training=False)
+    else:
+        x = base_model(inputs, training=trainable_backbone)
     
     # Custom Classification Head
     x = layers.GlobalAveragePooling2D(name="global_avg_pool")(x)
@@ -101,11 +104,18 @@ def build_keras_model(
     return model
 
 
-def unfreeze_model_backbone(model: keras.Model, unfreeze_layers: Optional[int] = None) -> keras.Model:
+def unfreeze_model_backbone(
+    model: keras.Model,
+    unfreeze_layers: Optional[int] = None,
+    model_name_key: Optional[str] = None
+) -> keras.Model:
     """
     Unfreezes backbone layers for fine-tuning.
-    If unfreeze_layers is specified, unfreezes the last N layers of the backbone;
-    otherwise unfreezes the entire backbone.
+    For MobileNetV3Large, performs controlled fine-tuning:
+      - Freezes all layers 0..146 (first 147 layers).
+      - Fine-tunes only non-BatchNormalization layers in top 40 layers.
+      - Keeps ALL BatchNormalization layers frozen (trainable=False).
+    For other models, unfreezes top N layers or all backbone layers.
     """
     # Identify the base model layer (usually layer 1 or layer with 'mobilenet', 'resnet', etc.)
     base_model = None
@@ -118,14 +128,73 @@ def unfreeze_model_backbone(model: keras.Model, unfreeze_layers: Optional[int] =
         # If model was built without a nested Functional base model, iterate layers directly
         base_model = model
 
-    base_model.trainable = True
-    
-    if unfreeze_layers is not None and unfreeze_layers > 0:
-        # Freeze all layers up to the last unfreeze_layers
-        for layer in base_model.layers[:-unfreeze_layers]:
+    is_mobilenet_v3 = False
+    if model_name_key == "mobilenet_v3_large":
+        is_mobilenet_v3 = True
+    elif model.name == "07_MobileNetV3Large" or (base_model and ("mobilenet" in base_model.name.lower() and "v3" in base_model.name.lower() and "large" in base_model.name.lower())):
+        is_mobilenet_v3 = True
+
+    if is_mobilenet_v3:
+        base_model.trainable = True
+        total_layers = len(base_model.layers)
+        
+        # 1. Freeze ALL backbone layers initially
+        for layer in base_model.layers:
             layer.trainable = False
-        print(f"[FINE-TUNING] Unfroze top {unfreeze_layers} layers of backbone.")
+
+        # 2. Select final 40 backbone layers
+        fine_tune_count = 40
+        earlier_frozen_count = max(0, total_layers - fine_tune_count)
+        fine_tune_region = base_model.layers[-fine_tune_count:]
+
+        # 3. Inside final 40 layers, keep BatchNorm layers frozen, unfreeze non-BatchNorm
+        for layer in fine_tune_region:
+            is_bn = (
+                isinstance(layer, (tf.keras.layers.BatchNormalization, keras.layers.BatchNormalization))
+                or "BatchNormalization" in layer.__class__.__name__
+                or "BatchNorm" in layer.__class__.__name__
+            )
+            if is_bn:
+                layer.trainable = False
+            else:
+                layer.trainable = True
+
+        total_bn_layers = sum(
+            1 for layer in base_model.layers
+            if isinstance(layer, (tf.keras.layers.BatchNormalization, keras.layers.BatchNormalization))
+            or "BatchNormalization" in layer.__class__.__name__
+            or "BatchNorm" in layer.__class__.__name__
+        )
+        trainable_backbone_layers = sum(1 for layer in base_model.layers if layer.trainable)
+        trainable_bn_layers = sum(
+            1 for layer in base_model.layers
+            if layer.trainable and (
+                isinstance(layer, (tf.keras.layers.BatchNormalization, keras.layers.BatchNormalization))
+                or "BatchNormalization" in layer.__class__.__name__
+                or "BatchNorm" in layer.__class__.__name__
+            )
+        )
+
+        assert trainable_bn_layers == 0, f"Error: Found {trainable_bn_layers} trainable BatchNormalization layers!"
+
+        print("============================================================")
+        print("MOBILENETV3 LARGE CONTROLLED FINE-TUNING")
+        print("============================================================")
+        print(f"Total backbone layers:\n{total_layers}\n")
+        print("Fine-tuning region:\nLast 40 layers\n")
+        print(f"Frozen earlier layers:\n{earlier_frozen_count}\n")
+        print(f"Total BatchNormalization layers:\n{total_bn_layers}\n")
+        print(f"Trainable backbone layers:\n{trainable_backbone_layers}\n")
+        print(f"Trainable BatchNormalization layers:\n{trainable_bn_layers}")
+        print("============================================================")
+
     else:
-        print("[FINE-TUNING] Unfroze all backbone layers for full fine-tuning.")
+        base_model.trainable = True
+        if unfreeze_layers is not None and unfreeze_layers > 0:
+            for layer in base_model.layers[:-unfreeze_layers]:
+                layer.trainable = False
+            print(f"[FINE-TUNING] Unfroze top {unfreeze_layers} layers of backbone.")
+        else:
+            print("[FINE-TUNING] Unfroze all backbone layers for full fine-tuning.")
 
     return model

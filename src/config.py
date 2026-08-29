@@ -92,8 +92,14 @@ class Config:
         """Resolves root path dynamically (Google Drive vs Local workspace)."""
         drive_path = "/content/drive/MyDrive"
         if os.path.exists(drive_path):
+            major_proj = os.path.join(drive_path, "Major_Project")
+            if os.path.exists(major_proj):
+                return major_proj
             return os.path.join(drive_path, cls.PROJECT_NAME)
-        return os.path.join(os.getcwd(), cls.PROJECT_NAME)
+        cwd = os.getcwd()
+        if os.path.exists(os.path.join(cwd, cls.PROJECT_NAME)):
+            return os.path.join(cwd, cls.PROJECT_NAME)
+        return cwd
 
     @classmethod
     def get_raw_dir(cls) -> str:

@@ -222,7 +222,10 @@ def train_model(
     remaining_epochs = max(0, epochs - warmup_epochs)
     if remaining_epochs > 0:
         logger.info(f"\n--- STAGE 2: FINE-TUNING ({remaining_epochs} Remaining Epochs, Unfrozen Backbone) ---")
-        model = unfreeze_model_backbone(model)
+        model = unfreeze_model_backbone(
+            model,
+            model_name_key=model_key
+        )
 
         fine_tune_optimizer = get_optimizer(optimizer_name, learning_rate=fine_tune_lr)
         model.compile(
