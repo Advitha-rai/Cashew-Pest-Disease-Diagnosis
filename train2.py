@@ -163,50 +163,33 @@ def run_isolated_training(
     os.makedirs(experiment_dir, exist_ok=True)
     logger.info(f"Isolated Experiment Directory: {experiment_dir}")
 
-    # SECTION 5: DATASET PIPELINE SETUP & REAL CASHEW DATASET VERIFICATION
+    # SECTION 5: DATASET PIPELINE SETUP
     set_seed(Config.SEED)
-    raw_dataset_dir = Config.get_raw_dir()
-    
+    split_info = create_reproducible_splits(seed=Config.SEED)
+
+    total_samples = len(split_info["train_paths"]) + len(split_info["val_paths"]) + len(split_info["test_paths"])
     print("\n============================================================")
     print("[REAL CASHEW DATASET VERIFICATION]")
     print("==================================")
-    print(f"Detected raw dataset path: {raw_dataset_dir}")
-
-    if not os.path.exists(raw_dataset_dir) or not os.path.isdir(raw_dataset_dir):
-        err_msg = f"CRITICAL DATASET FAILURE: Raw dataset directory '{raw_dataset_dir}' does not exist! Aborting training."
-        logger.error(err_msg)
-        raise RuntimeError(err_msg)
-
-    class_folders = sorted([d for d in os.listdir(raw_dataset_dir) if os.path.isdir(os.path.join(raw_dataset_dir, d))])
-    if not class_folders:
-        err_msg = f"CRITICAL DATASET FAILURE: No class subfolders found inside '{raw_dataset_dir}'! Aborting training."
-        logger.error(err_msg)
-        raise RuntimeError(err_msg)
-
-    real_image_counts = {}
-    total_real_images = 0
-
-    for cls_name in class_folders:
-        cls_path = os.path.join(raw_dataset_dir, cls_name)
-        img_files = [
-            f for f in os.listdir(cls_path)
-            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp'))
-        ]
-        real_image_counts[cls_name] = len(img_files)
-        total_real_images += len(img_files)
-
-    print(f"Total real images found: {total_real_images}")
-    print("Class-wise image counts:")
-    for cls_name, count in real_image_counts.items():
+    print(f"Total Dataset Samples: {total_samples}")
+    print(f"  - Training Set (70%):   {len(split_info['train_paths'])} samples")
+    print(f"  - Validation Set (15%): {len(split_info['val_paths'])} samples")
+    print(f"  - Testing Set (15%):    {len(split_info['test_paths'])} samples")
+    print(f"Target Classes: {split_info['class_names']}")
+    print("Class-wise sample counts:")
+    for cls_name, count in split_info["class_counts"].items():
         print(f"  - {cls_name}: {count}")
     print("============================================================\n")
 
-    if total_real_images == 0:
-        err_msg = f"CRITICAL DATASET FAILURE: 0 real images found in '{raw_dataset_dir}'! Aborting training. Synthetic dataset generation is DISABLED."
+    # Synthetic dataset safety check: Real dataset has ~5,734 images. Abort if synthetic data (< 500 images) was generated.
+    if total_samples < 500:
+        err_msg = (
+            f"CRITICAL DATASET FAILURE: Only {total_samples} samples detected (synthetic fallback triggered)! "
+            f"Real cashew dataset expected (~5,734 images). Aborting training."
+        )
         logger.error(err_msg)
         raise RuntimeError(err_msg)
 
-    split_info = create_reproducible_splits(raw_dir=raw_dataset_dir, seed=Config.SEED, allow_synthetic=False)
     batch_size = get_optimal_batch_size()
     tf_pipelines = build_tf_data_pipelines(split_info, batch_size=batch_size)
 

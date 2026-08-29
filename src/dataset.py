@@ -168,8 +168,7 @@ def create_synthetic_cashew_dataset(dest_dir: str, num_per_class: int = 25) -> T
 # ---------------------------------------------------------
 def create_reproducible_splits(
     raw_dir: Optional[str] = None,
-    seed: int = Config.SEED,
-    allow_synthetic: bool = False
+    seed: int = Config.SEED
 ) -> Dict:
     """
     Creates 70% Train, 15% Validation, and 15% Testing stratified splits with a fixed random seed (42).
@@ -187,22 +186,10 @@ def create_reproducible_splits(
     # Verify dataset integrity & duplicates
     file_paths, class_names_list, class_counts = verify_and_clean_dataset(raw_dir, cleaned_dir)
 
-    # Fallback to synthetic dataset ONLY if explicitly allowed
+    # Fallback to synthetic dataset if Raw folder is empty
     if len(file_paths) == 0:
-        if allow_synthetic:
-            logger.warning("[DATASET NOTICE] Raw folder is empty. Generating synthetic sample dataset for testing...")
-            file_paths, class_names_list, class_counts = create_synthetic_cashew_dataset(cleaned_dir)
-        else:
-            err_msg = (
-                f"CRITICAL DATASET ERROR: Raw cashew dataset directory '{raw_dir}' is missing or contains 0 valid images!\n"
-                f"Automatic synthetic dataset generation is DISABLED.\n"
-                f"Please verify that Google Drive is mounted and real cashew images exist at:\n"
-                f"  - /content/drive/MyDrive/Cashew_Pest_Disease_Project/Dataset/Raw/\n"
-                f"  - OR /content/drive/MyDrive/Major_Project/Dataset/Raw/\n"
-                f"  - OR /content/drive/MyDrive/Cashew-Pest-Disease-Diagnosis/Dataset/Raw/"
-            )
-            logger.error(err_msg)
-            raise RuntimeError(err_msg)
+        logger.warning("[DATASET NOTICE] Raw folder is empty. Generating synthetic sample dataset for testing...")
+        file_paths, class_names_list, class_counts = create_synthetic_cashew_dataset(cleaned_dir)
 
     unique_classes = sorted(list(set(class_names_list)))
     class_to_idx = {c: i for i, c in enumerate(unique_classes)}
