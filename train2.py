@@ -142,11 +142,12 @@ def run_isolated_training(
     with open(script_file, "r", encoding="utf-8") as f:
         self_source = f.read()
 
+    forbidden_target_msg = "[" + "FINE-TUNING" + "] " + "Unfroze all backbone layers " + "for full fine-tuning."
     forbidden_target_unfreeze = "unfreeze" + "_" + "model" + "_" + "backbone" + "("
     forbidden_target_base = "base" + "_" + "model" + ".trainable" + " = " + "True"
     forbidden_target_backbone = "back" + "bone" + ".trainable" + " = " + "True"
     forbidden_patterns = [
-        "[FINE-TUNING] Unfroze all backbone layers for full fine-tuning.",
+        forbidden_target_msg,
         forbidden_target_base,
         forbidden_target_backbone,
         forbidden_target_unfreeze
