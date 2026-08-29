@@ -92,10 +92,10 @@ class Config:
         """Resolves root path dynamically (Google Drive vs Local workspace)."""
         drive_path = "/content/drive/MyDrive"
         if os.path.exists(drive_path):
-            major_proj = os.path.join(drive_path, "Major_Project")
-            if os.path.exists(major_proj):
-                return major_proj
-            return os.path.join(drive_path, cls.PROJECT_NAME)
+            proj_dir = os.path.join(drive_path, cls.PROJECT_NAME)
+            if os.path.exists(proj_dir):
+                return proj_dir
+            return proj_dir
         cwd = os.getcwd()
         if os.path.exists(os.path.join(cwd, cls.PROJECT_NAME)):
             return os.path.join(cwd, cls.PROJECT_NAME)

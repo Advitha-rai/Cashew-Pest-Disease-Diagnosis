@@ -59,18 +59,26 @@ def verify_and_clean_dataset(raw_dir: str, cleaned_dir: str) -> Tuple[List[str],
     seen_hashes = {}
     class_counts = {}
 
-    if not os.path.exists(raw_dir):
-        logger.warning(f"Raw directory '{raw_dir}' does not exist. Creating default directory structure.")
-        os.makedirs(raw_dir, exist_ok=True)
+    if not os.path.exists(raw_dir) or not os.path.isdir(raw_dir):
+        err_msg = (
+            f"[DATASET ERROR] Raw dataset directory '{raw_dir}' does not exist.\n"
+            f"Training pipeline stopped. Synthetic dataset generation is disabled for production training."
+        )
+        logger.error(err_msg)
+        raise RuntimeError(err_msg)
 
-    # Automatically detect folder names inside Raw directory as class labels
+    # Validate that expected class folders exist in Raw directory
     detected_classes = sorted([d for d in os.listdir(raw_dir) if os.path.isdir(os.path.join(raw_dir, d))])
-    
-    if not detected_classes:
-        logger.warning(f"No class subfolders found in {raw_dir}. Initializing default class folders: {Config.DEFAULT_CLASSES}")
-        detected_classes = Config.DEFAULT_CLASSES
-        for c in detected_classes:
-            os.makedirs(os.path.join(raw_dir, c), exist_ok=True)
+    missing_classes = [c for c in Config.DEFAULT_CLASSES if c not in detected_classes]
+
+    if missing_classes or not detected_classes:
+        err_msg = (
+            f"[DATASET ERROR] Raw dataset directory '{raw_dir}' is missing required class folders: {missing_classes}.\n"
+            f"Expected class folders: {Config.DEFAULT_CLASSES}. Found: {detected_classes}.\n"
+            f"Training pipeline stopped."
+        )
+        logger.error(err_msg)
+        raise RuntimeError(err_msg)
 
     logger.info(f"[DYNAMIC CLASS DETECTION] Detected {len(detected_classes)} target classes: {detected_classes}")
 
@@ -186,10 +194,15 @@ def create_reproducible_splits(
     # Verify dataset integrity & duplicates
     file_paths, class_names_list, class_counts = verify_and_clean_dataset(raw_dir, cleaned_dir)
 
-    # Fallback to synthetic dataset if Raw folder is empty
+    # Fail safely if no valid real dataset images were found
     if len(file_paths) == 0:
-        logger.warning("[DATASET NOTICE] Raw folder is empty. Generating synthetic sample dataset for testing...")
-        file_paths, class_names_list, class_counts = create_synthetic_cashew_dataset(cleaned_dir)
+        err_msg = (
+            f"[DATASET ERROR] No valid real dataset images were found in '{raw_dir}'.\n"
+            f"Training pipeline stopped.\n"
+            f"Synthetic dataset generation is disabled for production training."
+        )
+        logger.error(err_msg)
+        raise RuntimeError(err_msg)
 
     unique_classes = sorted(list(set(class_names_list)))
     class_to_idx = {c: i for i, c in enumerate(unique_classes)}
