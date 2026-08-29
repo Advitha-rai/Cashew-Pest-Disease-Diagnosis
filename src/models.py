@@ -131,7 +131,11 @@ def unfreeze_model_backbone(
     is_mobilenet_v3 = False
     if model_name_key == "mobilenet_v3_large":
         is_mobilenet_v3 = True
-    elif model.name == "07_MobileNetV3Large" or (base_model and ("mobilenet" in base_model.name.lower() and "v3" in base_model.name.lower() and "large" in base_model.name.lower())):
+    elif model.name in ["07_MobileNetV3Large", "mobilenet_v3_large"]:
+        is_mobilenet_v3 = True
+    elif base_model is not None and len(base_model.layers) == 187:
+        is_mobilenet_v3 = True
+    elif base_model is not None and ("mobilenet" in base_model.name.lower() and "v3" in base_model.name.lower()):
         is_mobilenet_v3 = True
 
     if is_mobilenet_v3:
@@ -187,6 +191,9 @@ def unfreeze_model_backbone(
         print("============================================================")
 
     else:
+        if model_name_key == "mobilenet_v3_large" or (base_model is not None and len(base_model.layers) == 187):
+            raise RuntimeError("CRITICAL ERROR: MobileNetV3Large reached generic unfreeze branch! Refusing to unfreeze full backbone.")
+
         base_model.trainable = True
         if unfreeze_layers is not None and unfreeze_layers > 0:
             for layer in base_model.layers[:-unfreeze_layers]:

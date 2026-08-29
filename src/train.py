@@ -231,13 +231,26 @@ def train_model(
         logger.info(f"  - unfreeze function signature: {inspect.signature(unfreeze_model_backbone)}")
         logger.info(f"  - model_key: {model_key}")
 
-        # HARD Runtime Check: Verify Loaded unfreeze_model_backbone Supports model_name_key
+        # HARD Runtime Check: Verify Loaded unfreeze_model_backbone Source Code & Signature
         if model_key == "mobilenet_v3_large":
             sig = inspect.signature(unfreeze_model_backbone)
             if "model_name_key" not in sig.parameters:
                 err_msg = "CRITICAL SAFETY ERROR: Loaded unfreeze_model_backbone() does not support model_name_key. Refusing to train Model #7."
                 logger.error(err_msg)
                 raise RuntimeError(err_msg)
+            
+            source_file = inspect.getsourcefile(unfreeze_model_backbone)
+            logger.info(f"[MODEL #7 RUNTIME SOURCE] {source_file}")
+            if source_file is None:
+                raise RuntimeError("CRITICAL: Could not determine source file of unfreeze_model_backbone")
+
+            source = inspect.getsource(unfreeze_model_backbone)
+            if "MobileNetV3Large controlled fine-tuning" not in source:
+                raise RuntimeError(
+                    "CRITICAL: Runtime unfreeze_model_backbone is NOT the controlled "
+                    "MobileNetV3Large implementation. Training aborted."
+                )
+
             logger.info("[MODEL #7 RUNTIME] Using controlled MobileNetV3Large fine-tuning implementation")
 
         # Execute Unfreeze with Explicit model_name_key
