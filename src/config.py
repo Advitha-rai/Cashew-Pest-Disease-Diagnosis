@@ -103,7 +103,38 @@ class Config:
 
     @classmethod
     def get_raw_dir(cls) -> str:
-        """Returns path to raw dataset: /content/drive/MyDrive/Cashew_Pest_Disease_Project/Dataset/Raw/"""
+        """Dynamically searches and resolves raw dataset directory across Google Drive and local workspace paths."""
+        cwd = os.getcwd()
+        drive_path = "/content/drive/MyDrive"
+        
+        candidates = [
+            os.path.join(drive_path, "Cashew_Pest_Disease_Project", "Dataset", "Raw"),
+            os.path.join(drive_path, "Major_Project", "Dataset", "Raw"),
+            os.path.join(drive_path, "Cashew-Pest-Disease-Diagnosis", "Dataset", "Raw"),
+            os.path.join(drive_path, "Dataset", "Raw"),
+            os.path.join(drive_path, "Cashew_Dataset"),
+            os.path.join(cwd, "Dataset", "Raw"),
+            os.path.join(cwd, "Dataset"),
+            os.path.join(cls.get_base_dir(), "Dataset", "Raw")
+        ]
+        
+        for path in candidates:
+            if os.path.exists(path) and os.path.isdir(path):
+                subdirs = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))]
+                if subdirs:
+                    has_images = False
+                    for d in subdirs:
+                        class_dir = os.path.join(path, d)
+                        try:
+                            images = [f for f in os.listdir(class_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp'))]
+                            if images:
+                                has_images = True
+                                break
+                        except Exception:
+                            continue
+                    if has_images:
+                        return os.path.abspath(path)
+        
         return os.path.join(cls.get_base_dir(), "Dataset", "Raw")
 
     @classmethod
