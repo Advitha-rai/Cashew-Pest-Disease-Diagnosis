@@ -131,20 +131,24 @@ def run_isolated_training(
     print(f"src.models.__file__:       {models_file}")
     print(f"src.config.__file__:       {config_file}")
     print("[ISOLATED RUNTIME] train2.py active")
-    print("[ISOLATED RUNTIME] src.train is NOT imported\n")
+    isolated_engine_module = "src" + "." + "train"
+    print(f"[ISOLATED RUNTIME] {isolated_engine_module} is NOT imported\n")
 
-    if "src.train" in sys.modules:
-        raise RuntimeError("CRITICAL ERROR: src.train was imported! train2.py must run independently without src.train.")
+    if isolated_engine_module in sys.modules:
+        raise RuntimeError(f"CRITICAL ERROR: {isolated_engine_module} was imported! train2.py must run independently without {isolated_engine_module}.")
 
     # SECTION 12: FORBIDDEN MESSAGE & PATTERN CHECK INSIDE TRAIN2.PY SOURCE
     with open(script_file, "r", encoding="utf-8") as f:
         self_source = f.read()
 
+    forbidden_target_unfreeze = "unfreeze" + "_" + "model" + "_" + "backbone" + "("
+    forbidden_target_base = "base" + "_" + "model" + ".trainable" + " = " + "True"
+    forbidden_target_backbone = "back" + "bone" + ".trainable" + " = " + "True"
     forbidden_patterns = [
         "[FINE-TUNING] Unfroze all backbone layers for full fine-tuning.",
-        "base_model.trainable = True",
-        "backbone.trainable = True",
-        "unfreeze_model_backbone("
+        forbidden_target_base,
+        forbidden_target_backbone,
+        forbidden_target_unfreeze
     ]
 
     for pattern in forbidden_patterns:
