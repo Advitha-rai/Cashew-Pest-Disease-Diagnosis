@@ -222,102 +222,10 @@ def train_model(
     remaining_epochs = max(0, epochs - warmup_epochs)
     if remaining_epochs > 0:
         logger.info(f"\n--- STAGE 2: FINE-TUNING ({remaining_epochs} Remaining Epochs, Unfrozen Backbone) ---")
-        
-        # Stage 2 Runtime Diagnostic & Hard Signature Verification
-        import inspect
-        logger.info("[RUNTIME DIAGNOSTIC] Stage 2 function verification:")
-        logger.info(f"  - src.train file: {__file__}")
-        logger.info(f"  - unfreeze function module: {unfreeze_model_backbone.__module__}")
-        logger.info(f"  - unfreeze function signature: {inspect.signature(unfreeze_model_backbone)}")
-        logger.info(f"  - model_key: {model_key}")
-
-        # HARD Runtime Check: Verify Loaded unfreeze_model_backbone Supports model_name_key
-        if model_key == "mobilenet_v3_large":
-            sig = inspect.signature(unfreeze_model_backbone)
-            if "model_name_key" not in sig.parameters:
-                err_msg = "CRITICAL SAFETY ERROR: Loaded unfreeze_model_backbone() does not support model_name_key. Refusing to train Model #7."
-                logger.error(err_msg)
-                raise RuntimeError(err_msg)
-            logger.info("[MODEL #7 RUNTIME] Using controlled MobileNetV3Large fine-tuning implementation")
-
-        # Execute Unfreeze with Explicit model_name_key
         model = unfreeze_model_backbone(
             model,
             model_name_key=model_key
         )
-
-        if model_key == "mobilenet_v3_large":
-            logger.info("[MODEL #7 RUNTIME] Controlled fine-tuning function completed")
-
-        # TASK 3: Defensive Safety Verification Guard for Model #7 (MobileNetV3Large)
-        if model_key == "mobilenet_v3_large":
-            backbone = None
-            for layer in model.layers:
-                if isinstance(layer, keras.Model):
-                    backbone = layer
-                    break
-            if backbone is None:
-                backbone = model
-
-            total_b_layers = len(backbone.layers)
-            total_bn = sum(
-                1 for l in backbone.layers
-                if isinstance(l, (tf.keras.layers.BatchNormalization, keras.layers.BatchNormalization))
-                or "BatchNormalization" in l.__class__.__name__
-                or "BatchNorm" in l.__class__.__name__
-            )
-            trainable_b = sum(1 for l in backbone.layers if l.trainable)
-            trainable_bn = sum(
-                1 for l in backbone.layers
-                if l.trainable and (
-                    isinstance(l, (tf.keras.layers.BatchNormalization, keras.layers.BatchNormalization))
-                    or "BatchNormalization" in l.__class__.__name__
-                    or "BatchNorm" in l.__class__.__name__
-                )
-            )
-            frozen_earlier = sum(1 for l in backbone.layers[:-40] if not l.trainable)
-
-            errors = []
-            if total_b_layers != 187:
-                errors.append(f"Total backbone layers: expected 187, got {total_b_layers}")
-            if total_bn != 46:
-                errors.append(f"Total BatchNormalization layers: expected 46, got {total_bn}")
-            if trainable_b != 32:
-                errors.append(f"Trainable backbone layers: expected 32, got {trainable_b}")
-            if trainable_bn != 0:
-                errors.append(f"Trainable BatchNormalization layers: expected 0, got {trainable_bn}")
-            if frozen_earlier != 147:
-                errors.append(f"Frozen earlier backbone layers: expected 147, got {frozen_earlier}")
-
-            if errors:
-                err_msg = (
-                    "CRITICAL SAFETY ERROR: Model #7 controlled fine-tuning safety verification failed!\n"
-                    + "\n".join(f" - {e}" for e in errors)
-                    + f"\nActual counts vs Expected counts: Total Layers={total_b_layers} (exp 187), "
-                    f"Total BN={total_bn} (exp 46), Trainable Backbone={trainable_b} (exp 32), "
-                    f"Trainable BN={trainable_bn} (exp 0), Frozen Earlier={frozen_earlier} (exp 147)."
-                )
-                logger.error(err_msg)
-                raise RuntimeError(err_msg)
-
-            print("============================================================")
-            print("[TRAINING SAFETY] Model #7 controlled fine-tuning VERIFIED")
-            print("Total backbone layers: 187")
-            print("Total BatchNormalization layers: 46")
-            print("Trainable backbone layers: 32")
-            print("Trainable BatchNormalization layers: 0")
-            print("Frozen earlier backbone layers: 147")
-            print("============================================================")
-
-            logger.info("[MODEL #7 STAGE 2 RUNTIME CHECK]")
-            logger.info(f"  - backbone total layers: {total_b_layers}")
-            logger.info(f"  - trainable backbone layers: {trainable_b}")
-            logger.info(f"  - trainable BN layers: {trainable_bn}")
-            logger.info(f"  - frozen earlier layers: {frozen_earlier}")
-            logger.info(f"  - number of BN layers: {total_bn}")
-            logger.info(f"  - current optimizer learning rate: {fine_tune_lr}")
-            logger.info("  - backbone inference mode forced: YES (training=False bound in Functional graph)")
-            logger.info(f"  - total trainable variable weight tensors: {len(model.trainable_variables)}")
 
         fine_tune_optimizer = get_optimizer(optimizer_name, learning_rate=fine_tune_lr)
         model.compile(
@@ -419,4 +327,3 @@ def train_model(
         with open(config_json_path, "w") as f:
             json.dump(full_config, f, indent=4)
         logger.info(f"[CONFIG SAVED] Full training configuration saved to: {config_json_path}")
-

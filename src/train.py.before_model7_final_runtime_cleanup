@@ -223,29 +223,28 @@ def train_model(
     if remaining_epochs > 0:
         logger.info(f"\n--- STAGE 2: FINE-TUNING ({remaining_epochs} Remaining Epochs, Unfrozen Backbone) ---")
         
-        # Stage 2 Runtime Diagnostic & Hard Signature Verification
+        # TASK 1: Runtime Import Diagnostic
         import inspect
-        logger.info("[RUNTIME DIAGNOSTIC] Stage 2 function verification:")
-        logger.info(f"  - src.train file: {__file__}")
-        logger.info(f"  - unfreeze function module: {unfreeze_model_backbone.__module__}")
-        logger.info(f"  - unfreeze function signature: {inspect.signature(unfreeze_model_backbone)}")
-        logger.info(f"  - model_key: {model_key}")
+        import src.train
+        import src.models
+        logger.info("[RUNTIME DIAGNOSTIC] Module Import Verification:")
+        logger.info(f"  - src.train.__file__:              {src.train.__file__}")
+        logger.info(f"  - src.models.__file__:             {src.models.__file__}")
+        logger.info(f"  - unfreeze_model_backbone module:   {unfreeze_model_backbone.__module__}")
+        logger.info(f"  - unfreeze_model_backbone signature: {inspect.signature(unfreeze_model_backbone)}")
+        logger.info(f"  - model_key:                        {model_key}")
 
-        # HARD Runtime Check: Verify Loaded unfreeze_model_backbone Supports model_name_key
+        # TASK 4: Runtime Fingerprint Before
         if model_key == "mobilenet_v3_large":
-            sig = inspect.signature(unfreeze_model_backbone)
-            if "model_name_key" not in sig.parameters:
-                err_msg = "CRITICAL SAFETY ERROR: Loaded unfreeze_model_backbone() does not support model_name_key. Refusing to train Model #7."
-                logger.error(err_msg)
-                raise RuntimeError(err_msg)
             logger.info("[MODEL #7 RUNTIME] Using controlled MobileNetV3Large fine-tuning implementation")
 
-        # Execute Unfreeze with Explicit model_name_key
+        # TASK 2: Execute Unfreeze with Explicit model_name_key
         model = unfreeze_model_backbone(
             model,
             model_name_key=model_key
         )
 
+        # TASK 4: Runtime Fingerprint After
         if model_key == "mobilenet_v3_large":
             logger.info("[MODEL #7 RUNTIME] Controlled fine-tuning function completed")
 
@@ -308,16 +307,6 @@ def train_model(
             print("Trainable BatchNormalization layers: 0")
             print("Frozen earlier backbone layers: 147")
             print("============================================================")
-
-            logger.info("[MODEL #7 STAGE 2 RUNTIME CHECK]")
-            logger.info(f"  - backbone total layers: {total_b_layers}")
-            logger.info(f"  - trainable backbone layers: {trainable_b}")
-            logger.info(f"  - trainable BN layers: {trainable_bn}")
-            logger.info(f"  - frozen earlier layers: {frozen_earlier}")
-            logger.info(f"  - number of BN layers: {total_bn}")
-            logger.info(f"  - current optimizer learning rate: {fine_tune_lr}")
-            logger.info("  - backbone inference mode forced: YES (training=False bound in Functional graph)")
-            logger.info(f"  - total trainable variable weight tensors: {len(model.trainable_variables)}")
 
         fine_tune_optimizer = get_optimizer(optimizer_name, learning_rate=fine_tune_lr)
         model.compile(
@@ -419,4 +408,3 @@ def train_model(
         with open(config_json_path, "w") as f:
             json.dump(full_config, f, indent=4)
         logger.info(f"[CONFIG SAVED] Full training configuration saved to: {config_json_path}")
-
