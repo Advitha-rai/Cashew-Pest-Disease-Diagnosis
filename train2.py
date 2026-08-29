@@ -22,6 +22,7 @@ from tensorflow import keras
 from src.config import Config
 from src.utils import set_seed, get_logger, get_optimal_batch_size
 from src.dataset import create_reproducible_splits, build_tf_data_pipelines
+import src.models
 from src.models import build_keras_model
 from src.loss import get_loss_function
 
