@@ -223,46 +223,49 @@ def train_model(
     if remaining_epochs > 0:
         logger.info(f"\n--- STAGE 2: FINE-TUNING ({remaining_epochs} Remaining Epochs, Unfrozen Backbone) ---")
         
-        # Stage 2 Runtime Diagnostic & Hard Signature Verification
+        # TASK 1: Dynamic Module Reload to prevent stale in-memory module execution
+        import importlib
         import inspect
-        logger.info("[RUNTIME DIAGNOSTIC] Stage 2 function verification:")
-        logger.info(f"  - src.train file: {__file__}")
-        logger.info(f"  - unfreeze function module: {unfreeze_model_backbone.__module__}")
-        logger.info(f"  - unfreeze function signature: {inspect.signature(unfreeze_model_backbone)}")
-        logger.info(f"  - model_key: {model_key}")
+        import src.models as models_module
 
-        # HARD Runtime Check: Verify Loaded unfreeze_model_backbone Source Code & Signature
+        models_module = importlib.reload(models_module)
+        runtime_unfreeze = models_module.unfreeze_model_backbone
+
+        # TASK 2: Hard Runtime Source Verification
+        logger.info("============================================================")
+        logger.info("[MODEL #7 RUNTIME SOURCE VERIFICATION]")
+        logger.info(f"src.models runtime file: {os.path.abspath(models_module.__file__)}")
+        logger.info(f"unfreeze function module: {runtime_unfreeze.__module__}")
+        logger.info(f"unfreeze function file: {inspect.getsourcefile(runtime_unfreeze)}")
+        logger.info(f"unfreeze function first line: {inspect.getsourcelines(runtime_unfreeze)[1]}")
+        logger.info("============================================================")
+
         if model_key == "mobilenet_v3_large":
-            sig = inspect.signature(unfreeze_model_backbone)
-            if "model_name_key" not in sig.parameters:
-                err_msg = "CRITICAL SAFETY ERROR: Loaded unfreeze_model_backbone() does not support model_name_key. Refusing to train Model #7."
+            runtime_source = inspect.getsource(runtime_unfreeze)
+            required_terms = [
+                "mobilenet_v3_large",
+                "total_backbone_layers",
+                "trainable_backbone_layers",
+                "trainable_bn_layers",
+                "frozen_earlier_layers"
+            ]
+            missing_terms = [term for term in required_terms if term not in runtime_source]
+            if missing_terms:
+                err_msg = (
+                    "CRITICAL RUNTIME ERROR: The active unfreeze_model_backbone "
+                    f"implementation is not the controlled MobileNetV3Large implementation. Missing terms: {missing_terms}"
+                )
                 logger.error(err_msg)
                 raise RuntimeError(err_msg)
-            
-            source_file = inspect.getsourcefile(unfreeze_model_backbone)
-            logger.info(f"[MODEL #7 RUNTIME SOURCE] {source_file}")
-            if source_file is None:
-                raise RuntimeError("CRITICAL: Could not determine source file of unfreeze_model_backbone")
+            logger.info("[MODEL #7 RUNTIME] Controlled MobileNetV3Large implementation verified in active source code.")
 
-            source = inspect.getsource(unfreeze_model_backbone)
-            if "MobileNetV3Large controlled fine-tuning" not in source:
-                raise RuntimeError(
-                    "CRITICAL: Runtime unfreeze_model_backbone is NOT the controlled "
-                    "MobileNetV3Large implementation. Training aborted."
-                )
-
-            logger.info("[MODEL #7 RUNTIME] Using controlled MobileNetV3Large fine-tuning implementation")
-
-        # Execute Unfreeze with Explicit model_name_key
-        model = unfreeze_model_backbone(
+        # TASK 1: Execute Runtime Unfreeze Function
+        model = runtime_unfreeze(
             model,
             model_name_key=model_key
         )
 
-        if model_key == "mobilenet_v3_large":
-            logger.info("[MODEL #7 RUNTIME] Controlled fine-tuning function completed")
-
-        # TASK 3: Defensive Safety Verification Guard for Model #7 (MobileNetV3Large)
+        # TASK 4: Final Safety Check in train.py after unfreeze call & before model.compile()
         if model_key == "mobilenet_v3_large":
             backbone = None
             for layer in model.layers:
@@ -345,6 +348,41 @@ def train_model(
             separator=",",
             append=True
         )
+
+        # TASK 5: Pre-Fit Absolute Safety Check
+        if model_key == "mobilenet_v3_large":
+            backbone = None
+            for layer in model.layers:
+                if isinstance(layer, keras.Model):
+                    backbone = layer
+                    break
+            if backbone is None:
+                backbone = model
+
+            pre_fit_b = len(backbone.layers)
+            pre_fit_trainable_b = sum(1 for l in backbone.layers if l.trainable)
+            pre_fit_trainable_bn = sum(
+                1 for l in backbone.layers
+                if (isinstance(l, (tf.keras.layers.BatchNormalization, keras.layers.BatchNormalization)) or "BatchNormalization" in l.__class__.__name__ or "BatchNorm" in l.__class__.__name__) and l.trainable
+            )
+            pre_fit_frozen_earlier = sum(1 for l in backbone.layers[:-40] if not l.trainable)
+
+            print("============================================================")
+            print("[PRE-FIT MODEL #7 SAFETY CHECK]")
+            print(f"Backbone layers: {pre_fit_b}")
+            print(f"Trainable backbone layers: {pre_fit_trainable_b}")
+            print(f"Trainable BN layers: {pre_fit_trainable_bn}")
+            print(f"Frozen earlier layers: {pre_fit_frozen_earlier}")
+            print("============================================================\n")
+
+            if (pre_fit_b, pre_fit_trainable_b, pre_fit_trainable_bn, pre_fit_frozen_earlier) != (187, 32, 0, 147):
+                err_msg = (
+                    f"CRITICAL PRE-FIT SAFETY FAILURE for Model #7: "
+                    f"Backbone={pre_fit_b} (exp 187), Trainable={pre_fit_trainable_b} (exp 32), "
+                    f"Trainable BN={pre_fit_trainable_bn} (exp 0), Frozen Earlier={pre_fit_frozen_earlier} (exp 147)."
+                )
+                logger.error(err_msg)
+                raise RuntimeError(err_msg)
 
         history_finetune = model.fit(
             train_ds,
