@@ -178,14 +178,12 @@ def unfreeze_model_backbone(
         assert trainable_bn_layers == 0, f"Error: Found {trainable_bn_layers} trainable BatchNormalization layers!"
 
         print("============================================================")
-        print("MOBILENETV3 LARGE CONTROLLED FINE-TUNING")
-        print("============================================================")
-        print(f"Total backbone layers:\n{total_layers}\n")
-        print("Fine-tuning region:\nLast 40 layers\n")
-        print(f"Frozen earlier layers:\n{earlier_frozen_count}\n")
-        print(f"Total BatchNormalization layers:\n{total_bn_layers}\n")
-        print(f"Trainable backbone layers:\n{trainable_backbone_layers}\n")
-        print(f"Trainable BatchNormalization layers:\n{trainable_bn_layers}")
+        print("[FINE-TUNING] MobileNetV3Large controlled fine-tuning")
+        print(f"Total backbone layers: {total_layers}")
+        print(f"Total BatchNormalization layers: {total_bn_layers}")
+        print(f"Trainable backbone layers: {trainable_backbone_layers}")
+        print(f"Trainable BatchNormalization layers: {trainable_bn_layers}")
+        print(f"Frozen earlier backbone layers: {earlier_frozen_count}")
         print("============================================================")
 
     else:
