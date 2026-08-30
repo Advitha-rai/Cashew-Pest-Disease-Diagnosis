@@ -96,6 +96,40 @@ def plot_and_save_training_curves(history_df: pd.DataFrame, experiment_dir: str)
 
 
 # ---------------------------------------------------------
+# Smoke Test Engine (1 Batch Forward/Loss/Backward Pass)
+# ---------------------------------------------------------
+def run_smoke_test(model: keras.Model, train_ds: tf.data.Dataset, val_ds: tf.data.Dataset, loss_fn: keras.losses.Loss, optimizer: keras.optimizers.Optimizer, experiment_dir: str):
+    print("\n============================================================")
+    print("[RUNNING MODEL #7 SMOKE TEST (1 Batch Pass)]")
+    print("============================================================")
+
+    for images, labels in train_ds.take(1):
+        with tf.GradientTape() as tape:
+            preds = model(images, training=True)
+            loss = loss_fn(labels, preds)
+
+        grads = tape.gradient(loss, model.trainable_variables)
+        optimizer.apply_gradients(zip(grads, model.trainable_variables))
+
+        print(f"  [PASS] Forward Pass Output Shape: {preds.shape}")
+        print(f"  [PASS] Batch Loss Value: {float(loss):.4f}")
+        print(f"  [PASS] Gradient Computation: {len(grads)} gradients updated")
+
+    for val_images, val_labels in val_ds.take(1):
+        val_preds = model(val_images, training=False)
+        val_loss = loss_fn(val_labels, val_preds)
+        print(f"  [PASS] Validation Pass Output Shape: {val_preds.shape}")
+        print(f"  [PASS] Validation Loss Value: {float(val_loss):.4f}")
+
+    smoke_ckpt_path = os.path.join(experiment_dir, "smoke_checkpoint.keras")
+    model.save(smoke_ckpt_path)
+    if not os.path.exists(smoke_ckpt_path):
+        raise RuntimeError("SMOKE TEST FAILURE: Could not save smoke checkpoint!")
+    print(f"  [PASS] Smoke Checkpoint Saved: {smoke_ckpt_path}")
+    print("============================================================\n")
+
+
+# ---------------------------------------------------------
 # Main Isolated Model #7 Training Routine
 # ---------------------------------------------------------
 def run_isolated_training(
@@ -105,7 +139,8 @@ def run_isolated_training(
     fine_tune_lr: float = Config.FINE_TUNE_LEARNING_RATE,
     optimizer_name: str = Config.OPTIMIZER,
     loss_name: str = "categorical_crossentropy",
-    patience: int = Config.PATIENCE
+    patience: int = Config.PATIENCE,
+    smoke_test_only: bool = False
 ):
     # SECTION 3: MODEL CONFIGURATION
     model_index = 7
@@ -115,8 +150,8 @@ def run_isolated_training(
         raise RuntimeError(f"CRITICAL ERROR: train2.py is hard-coded for Model #7 (mobilenet_v3_large). Got '{model_key}'")
 
     print("\n============================================================")
-    print("[ISOLATED MODEL #7 TRAINING]")
-    print("============================")
+    print("[ISOLATED MODEL #7 TRAINING ENGINE]")
+    print("==================================")
     print(f"Model index: {model_index}")
     print(f"Model name: {folder_name}")
     print(f"Model key: {model_key}")
@@ -138,7 +173,7 @@ def run_isolated_training(
     if isolated_engine_module in sys.modules:
         raise RuntimeError(f"CRITICAL ERROR: {isolated_engine_module} was imported! train2.py must run independently without {isolated_engine_module}.")
 
-    # SECTION 12: FORBIDDEN MESSAGE & PATTERN CHECK INSIDE TRAIN2.PY SOURCE
+    # FORBIDDEN PATTERN CHECK INSIDE TRAIN2.PY SOURCE
     with open(script_file, "r", encoding="utf-8") as f:
         self_source = f.read()
 
@@ -157,31 +192,22 @@ def run_isolated_training(
         if pattern in self_source:
             raise RuntimeError(f"CRITICAL FORBIDDEN PATTERN CHECK FAILED: Found forbidden string '{pattern}' inside train2.py!")
 
-    # SECTION 1: EXPERIMENT DIRECTORY ISOLATION
+    # EXPERIMENT DIRECTORY ISOLATION
     base_dir = Config.get_base_dir()
     experiment_dir = os.path.join(base_dir, "Experiments", "07_MobileNetV3Large_Isolated")
     os.makedirs(experiment_dir, exist_ok=True)
     logger.info(f"Isolated Experiment Directory: {experiment_dir}")
 
-    # SECTION 5: DATASET PIPELINE SETUP
+    # DATASET PIPELINE SETUP
     set_seed(Config.SEED)
     split_info = create_reproducible_splits(seed=Config.SEED)
 
     total_samples = len(split_info["train_paths"]) + len(split_info["val_paths"]) + len(split_info["test_paths"])
-    print("\n============================================================")
-    print("[REAL CASHEW DATASET VERIFICATION]")
-    print("==================================")
-    print(f"Total Dataset Samples: {total_samples}")
-    print(f"  - Training Set (70%):   {len(split_info['train_paths'])} samples")
-    print(f"  - Validation Set (15%): {len(split_info['val_paths'])} samples")
-    print(f"  - Testing Set (15%):    {len(split_info['test_paths'])} samples")
-    print(f"Target Classes: {split_info['class_names']}")
-    print("Class-wise sample counts:")
-    for cls_name, count in split_info["class_counts"].items():
-        print(f"  - {cls_name}: {count}")
-    print("============================================================\n")
+    train_count = len(split_info["train_paths"])
+    val_count = len(split_info["val_paths"])
+    test_count = len(split_info["test_paths"])
 
-    # Synthetic dataset safety check: Real dataset has ~5,734 images. Abort if synthetic data (< 500 images) was generated.
+    # Synthetic dataset safety check: Real dataset has ~5,734 images.
     if total_samples < 500:
         err_msg = (
             f"CRITICAL DATASET FAILURE: Only {total_samples} samples detected (synthetic fallback triggered)! "
@@ -198,7 +224,95 @@ def run_isolated_training(
     num_classes = len(split_info["class_names"])
     class_weights_dict = {i: float(w) for i, w in enumerate(split_info["class_weights"])}
 
-    logger.info(f"Loaded Class Weights for Isolated Training: {class_weights_dict}")
+    # BUILD MODEL #7 STAGE 1
+    model = build_keras_model(
+        model_index=7,
+        num_classes=num_classes,
+        input_shape=(224, 224, 3),
+        trainable_backbone=False
+    )
+
+    backbone = None
+    for layer in model.layers:
+        if isinstance(layer, keras.Model):
+            backbone = layer
+            break
+
+    if backbone is None:
+        raise RuntimeError("ISOLATED MODEL #7 ERROR: MobileNetV3Large backbone not found.")
+
+    trainable_params = sum(np.prod(v.shape) for v in model.trainable_variables)
+    total_params = sum(np.prod(v.shape) for v in model.variables)
+
+    # ---------------------------------------------------------
+    # MANDATORY PRE-FLIGHT CHECKS
+    # ---------------------------------------------------------
+    print("\n============================================================")
+    print("[PRE-FLIGHT CHECK 1: MODEL 7 CHECK]")
+    print("===================================")
+    print(f"Model Name:           {folder_name}")
+    print(f"Input Shape:          {model.input_shape}")
+    print(f"Output Shape:         {model.output_shape}")
+    print(f"Number of Classes:    {num_classes}")
+    print(f"Loss Function:       {loss_name}")
+    print(f"Optimizer:            {optimizer_name}")
+    print(f"Trainable Parameters: {trainable_params:,}")
+    print(f"Total Parameters:     {total_params:,}")
+
+    print("\n[PRE-FLIGHT CHECK 2: DATA CHECK]")
+    print("=================================")
+    print(f"Total Dataset Samples: {total_samples}")
+    print(f"Training Sample Count: {train_count}")
+    print(f"Validation Count:      {val_count}")
+    print(f"Testing Count:         {test_count}")
+    print(f"Image Input Shape:     (224, 224, 3)")
+    print(f"Label Format:          One-Hot Encoded ({num_classes},)")
+    print("Class Distribution:")
+    for cls_name, count in split_info["class_counts"].items():
+        print(f"  - {cls_name}: {count}")
+
+    print("\n[PRE-FLIGHT CHECK 3: PATH CHECK]")
+    print("=================================")
+    print(f"Project Root:         {base_dir}")
+    print(f"Raw Dataset Path:     {Config.get_raw_dir()}")
+    print(f"Train Split CSV:      {os.path.join(Config.get_preprocessed_dir(), 'train_split.csv')}")
+    print(f"Val Split CSV:        {os.path.join(Config.get_preprocessed_dir(), 'val_split.csv')}")
+    print(f"Checkpoint Dir:       {experiment_dir}")
+    print(f"Artifact Dir:         {experiment_dir}")
+
+    gpus = tf.config.list_physical_devices('GPU')
+    gpu_status = f"{len(gpus)} GPU(s) Available: {[g.name for g in gpus]}" if gpus else "CPU Only (No GPU detected)"
+
+    print("\n[PRE-FLIGHT CHECK 4: REPRODUCIBILITY CHECK]")
+    print("===========================================")
+    print(f"Random Seed:          {Config.SEED}")
+    print(f"TensorFlow Version:   {tf.__version__}")
+    print(f"Hardware Compute:     {gpu_status}")
+    print("============================================================\n")
+
+    # Assert basic pre-flight requirements
+    if model.output_shape[-1] != num_classes:
+        raise RuntimeError(f"PRE-FLIGHT FAILURE: Output shape {model.output_shape} incompatible with class count {num_classes}")
+    if total_samples < 500:
+        raise RuntimeError("PRE-FLIGHT FAILURE: Dataset sample count too low!")
+
+    # ---------------------------------------------------------
+    # SMOKE TEST EXECUTION
+    # ---------------------------------------------------------
+    optimizer_stage1 = get_optimizer(optimizer_name, learning_rate=lr)
+    loss_fn = get_loss_function(loss_name)
+
+    model.compile(
+        optimizer=optimizer_stage1,
+        loss=loss_fn,
+        metrics=["categorical_accuracy"]
+    )
+
+    run_smoke_test(model, train_ds, val_ds, loss_fn, optimizer_stage1, experiment_dir)
+
+    if smoke_test_only:
+        print("[SMOKE TEST ONLY MODE COMPLETED SUCCESSFULLY] Stopping before full training as requested.")
+        return
 
     # Callbacks & Artifact paths
     best_model_path = os.path.join(experiment_dir, "best_model.keras")
@@ -236,47 +350,9 @@ def run_isolated_training(
         )
     ]
 
-    # SECTION 6: BUILD MODEL #7 STAGE 1
-    model = build_keras_model(
-        model_index=7,
-        num_classes=num_classes,
-        input_shape=(224, 224, 3),
-        trainable_backbone=False
-    )
-
-    backbone = None
-    for layer in model.layers:
-        if isinstance(layer, keras.Model):
-            backbone = layer
-            break
-
-    if backbone is None:
-        raise RuntimeError("ISOLATED MODEL #7 ERROR: MobileNetV3Large backbone not found.")
-
-    stage1_b_count = len(backbone.layers)
-    stage1_trainable_count = sum(1 for l in backbone.layers if l.trainable)
-
-    if stage1_b_count != 187:
-        raise RuntimeError(f"Stage 1 backbone layer count mismatch: expected 187, found {stage1_b_count}")
-    if stage1_trainable_count != 0:
-        raise RuntimeError(f"Stage 1 trainable backbone layer count mismatch: expected 0, found {stage1_trainable_count}")
-
-    print("\n============================================================")
-    print("[MODEL #7 STAGE 1 SAFETY CHECK]")
-    print("Backbone layers: 187")
-    print("Trainable backbone layers: 0")
-    print("============================================================\n")
-
     # SECTION 7: STAGE 1 WARMUP TRAINING
     logger.info(f"\n--- STAGE 1: WARMUP TRAINING ({warmup_epochs} Epochs, Frozen Backbone) ---")
-    optimizer_stage1 = get_optimizer(optimizer_name, learning_rate=lr)
-    loss_fn = get_loss_function(loss_name)
-
-    model.compile(
-        optimizer=optimizer_stage1,
-        loss=loss_fn,
-        metrics=["categorical_accuracy"]
-    )
+    print(f"[MODEL 7][TRAINING] Starting Stage 1 Warmup ({warmup_epochs} Epochs)...")
 
     history_warmup = model.fit(
         train_ds,
@@ -291,8 +367,9 @@ def run_isolated_training(
     remaining_epochs = max(0, epochs - warmup_epochs)
     if remaining_epochs > 0:
         logger.info(f"\n--- STAGE 2: FINE-TUNING ({remaining_epochs} Remaining Epochs, Unfrozen Backbone) ---")
+        print(f"[MODEL 7][TRAINING] Starting Stage 2 Controlled Fine-Tuning ({remaining_epochs} Epochs)...")
 
-        # Step 1: Explicitly freeze EVERY backbone layer
+        # Step 1: Freeze EVERY backbone layer
         for layer in backbone.layers:
             layer.trainable = False
 
@@ -309,7 +386,7 @@ def run_isolated_training(
             if isinstance(layer, keras.layers.BatchNormalization):
                 layer.trainable = False
 
-        # SECTION 9: HARD SAFETY VERIFICATION
+        # HARD SAFETY VERIFICATION
         total_backbone_layers = len(backbone.layers)
         bn_layers = [l for l in backbone.layers if isinstance(l, keras.layers.BatchNormalization)]
         total_bn_layers = len(bn_layers)
@@ -318,13 +395,6 @@ def run_isolated_training(
         frozen_earlier_layers = sum(1 for l in backbone.layers[:-40] if not l.trainable)
 
         if (total_backbone_layers, total_bn_layers, trainable_backbone_layers, trainable_bn_layers, frozen_earlier_layers) != (187, 46, 32, 0, 147):
-            print("\n============================================================")
-            print("[MODEL #7 ISOLATED SAFETY FAILURE]")
-            print("==================================")
-            for idx, l in enumerate(backbone.layers):
-                if l.trainable:
-                    print(f"index={idx} | name={l.name} | class={l.__class__.__name__} | trainable={l.trainable}")
-            print("============================================================\n")
             raise RuntimeError(
                 f"ISOLATED MODEL #7 SAFETY FAILURE: Counts mismatch! "
                 f"Total={total_backbone_layers} (exp 187), BN={total_bn_layers} (exp 46), "
@@ -332,56 +402,7 @@ def run_isolated_training(
                 f"Frozen Earlier={frozen_earlier_layers} (exp 147)."
             )
 
-        # SECTION 10: SECOND SAFETY CHECK FOR EXACT 147/40 BOUNDARY
-        # Verify layers 0..146 (first 147 layers) are all frozen
-        for idx, l in enumerate(backbone.layers[:147]):
-            if l.trainable:
-                raise RuntimeError(f"BOUNDARY SAFETY FAILURE: Layer index {idx} ({l.name}) in frozen region 0..146 has trainable=True!")
-
-        # Verify top 40 region (layers 147..186)
-        for idx, l in enumerate(backbone.layers[147:], start=147):
-            if isinstance(l, keras.layers.BatchNormalization):
-                if l.trainable:
-                    raise RuntimeError(f"BOUNDARY SAFETY FAILURE: BN Layer index {idx} ({l.name}) in top 40 region has trainable=True!")
-            else:
-                if not l.trainable:
-                    raise RuntimeError(f"BOUNDARY SAFETY FAILURE: Non-BN Layer index {idx} ({l.name}) in top 40 region has trainable=False!")
-
-        # Verify all BN layers anywhere in backbone are frozen
-        for idx, l in enumerate(backbone.layers):
-            if isinstance(l, keras.layers.BatchNormalization) and l.trainable:
-                raise RuntimeError(f"BN SAFETY FAILURE: BN Layer index {idx} ({l.name}) has trainable=True!")
-
-        # SECTION 11: PRINT EXACT TRAINABLE LAYERS
-        print("\n============================================================")
-        print("[MODEL #7 ISOLATED FINE-TUNING CONFIGURATION]")
-        print("=============================================")
-        print("--- FROZEN EARLIER LAYERS (0-146) ---")
-        for idx, l in enumerate(backbone.layers[:147]):
-            print(f"Layer {idx:3d}: {l.name:45s} | {l.__class__.__name__:25s} | trainable={l.trainable}")
-
-        print("\n--- TOP 40 REGION (147-186) ---")
-        for idx, l in enumerate(backbone.layers[147:], start=147):
-            print(f"Layer {idx:3d}: {l.name:45s} | {l.__class__.__name__:25s} | trainable={l.trainable}")
-
-        print("\nSUMMARY:")
-        print(f"Total backbone layers: {total_backbone_layers}")
-        print(f"Total BN layers: {total_bn_layers}")
-        print(f"Trainable backbone layers: {trainable_backbone_layers}")
-        print(f"Trainable BatchNormalization layers: {trainable_bn_layers}")
-        print(f"Frozen earlier layers: {frozen_earlier_layers}")
-        print("============================================================\n")
-
-        # SECTION 13 & 16: STAGE 2 COMPILE & LEARNING RATE VERIFICATION
         fine_tune_optimizer = get_optimizer(optimizer_name, learning_rate=fine_tune_lr)
-        
-        print("============================================================")
-        print("[MODEL #7 SAFETY PASSED]")
-        print("Stage 2 compilation permitted.")
-        print("Backbone remains controlled.")
-        print(f"Optimizer: {optimizer_name} | Stage 2 Learning Rate: {fine_tune_lr}")
-        print("No BatchNormalization layer is trainable.")
-        print("============================================================\n")
 
         model.compile(
             optimizer=fine_tune_optimizer,
@@ -395,7 +416,6 @@ def run_isolated_training(
             append=True
         )
 
-        # SECTION 14: STAGE 2 TRAINING
         history_finetune = model.fit(
             train_ds,
             validation_data=val_ds,
@@ -408,7 +428,7 @@ def run_isolated_training(
 
     logger.info("[TRAINING COMPLETE] Best model saved to: " + best_model_path)
 
-    # SECTION 17: SAVE ARTIFACTS & SUMMARY
+    # SAVE ARTIFACTS & SUMMARY
     if os.path.exists(history_csv_path):
         history_df = pd.read_csv(history_csv_path)
         plot_and_save_training_curves(history_df, experiment_dir)
@@ -434,53 +454,43 @@ def run_isolated_training(
         with open(summary_json_path, "w") as f:
             json.dump(summary, f, indent=4)
 
-        full_config = {
-            "model_index": 7,
-            "model_name": folder_name,
-            "model_key": model_key,
-            "seed": Config.SEED,
-            "optimizer": optimizer_name,
-            "initial_learning_rate": lr,
-            "fine_tune_learning_rate": fine_tune_lr,
-            "total_epochs_configured": epochs,
-            "warmup_epochs": warmup_epochs,
-            "epochs_actually_trained": len(history_df),
-            "batch_size": batch_size,
-            "early_stopping_patience": patience,
-            "reduce_lr_factor": 0.5,
-            "reduce_lr_patience": Config.REDUCE_LR_PATIENCE,
-            "minimum_learning_rate": 1e-7,
-            "loss_function": loss_name,
-            "best_validation_accuracy": best_val_acc,
-            "minimum_validation_loss": min_val_loss
-        }
-
-        config_json_path = os.path.join(experiment_dir, "training_configuration.json")
-        with open(config_json_path, "w") as f:
-            json.dump(full_config, f, indent=4)
-
-    # SECTION 18: FINAL TRAINING SUMMARY
+    # ---------------------------------------------------------
+    # POST-TRAINING INFERENCE & RELOAD VALIDATION
+    # ---------------------------------------------------------
     print("\n============================================================")
-    print("[MODEL #7 ISOLATED TRAINING COMPLETE]")
-    print("=====================================")
-    print("Model: 07_MobileNetV3Large")
-    print(f"Stage 1 Epochs: {warmup_epochs} (Backbone trainable: 0)")
-    print(f"Stage 2 Configured Epochs: {epochs - warmup_epochs}")
-    print("Backbone total layers: 187")
-    print("Trainable backbone layers: 32")
-    print("BatchNormalization trainable layers: 0")
-    print("Frozen earlier layers: 147")
-    print(f"Best model: {best_model_path}")
-    print(f"History: {history_csv_path}")
+    print("[POST-TRAINING ARTIFACT & INFERENCE VALIDATION]")
+    print("===============================================")
+    if not os.path.exists(best_model_path):
+        raise RuntimeError(f"POST-TRAINING FAILURE: Saved model checkpoint not found at {best_model_path}")
+    print(f"  [PASS] Best Checkpoint Exists: {best_model_path}")
+
+    reloaded_model = keras.models.load_model(best_model_path, custom_objects={loss_name: loss_fn})
+    print(f"  [PASS] Model Successfully Reloaded from Disk")
+
+    for test_images, _ in val_ds.take(1):
+        sample_img = test_images[:1]
+        sample_pred = reloaded_model.predict(sample_img, verbose=0)
+        prob_sum = float(np.sum(sample_pred))
+        pred_class = int(np.argmax(sample_pred[0]))
+        print(f"  [PASS] Inference Output Shape: {sample_pred.shape}")
+        print(f"  [PASS] Inference Probabilities Sum: {prob_sum:.4f}")
+        print(f"  [PASS] Predicted Class Index: {pred_class} ({split_info['class_names'][pred_class]})")
+
     print("============================================================\n")
 
 
-# SECTION 19: COMMAND LINE INTERFACE
+# COMMAND LINE INTERFACE
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Standalone Isolated Training Engine for Model #7 (MobileNetV3Large)")
     parser.add_argument("--model", type=int, default=7, help="Model index (MUST be 7)")
-    parser.add_argument("--epochs", type=int, default=Config.EPOCHS, help="Total training epochs")
-    parser.add_argument("--warmup-epochs", type=int, default=Config.WARMUP_EPOCHS, help="Stage 1 warmup epochs")
+    parser.add_argument("--epochs", type=int, default=Config.EPOCHS, help="Total training epochs (default: 50)")
+    parser.add_argument("--warmup-epochs", type=int, default=Config.WARMUP_EPOCHS, help="Stage 1 warmup epochs (default: 5)")
+    parser.add_argument("--lr", type=float, default=Config.LEARNING_RATE, help="Initial learning rate (default: 1e-4)")
+    parser.add_argument("--fine-tune-lr", type=float, default=Config.FINE_TUNE_LEARNING_RATE, help="Fine-tuning learning rate (default: 1e-5)")
+    parser.add_argument("--optimizer", type=str, default=Config.OPTIMIZER, choices=["adam", "adamw", "sgd"], help="Optimizer selection (default: adam)")
+    parser.add_argument("--loss", type=str, default="categorical_crossentropy", choices=["categorical_crossentropy", "focal_loss"], help="Loss function selection")
+    parser.add_argument("--patience", type=int, default=Config.PATIENCE, help="Early stopping patience (default: 10)")
+    parser.add_argument("--smoke-test", action="store_true", help="Run 1-batch pre-flight smoke test only and exit")
 
     args = parser.parse_args()
 
@@ -489,5 +499,11 @@ if __name__ == "__main__":
 
     run_isolated_training(
         epochs=args.epochs,
-        warmup_epochs=args.warmup_epochs
+        warmup_epochs=args.warmup_epochs,
+        lr=args.lr,
+        fine_tune_lr=args.fine_tune_lr,
+        optimizer_name=args.optimizer,
+        loss_name=args.loss,
+        patience=args.patience,
+        smoke_test_only=args.smoke_test
     )

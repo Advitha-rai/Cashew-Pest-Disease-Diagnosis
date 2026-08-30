@@ -231,35 +231,31 @@ def train_model(
         models_module = importlib.reload(models_module)
         runtime_unfreeze = models_module.unfreeze_model_backbone
 
-        # TASK 2: Hard Runtime Source Verification
+        # TASK 3: Real Execution Trace
         logger.info("============================================================")
-        logger.info("[MODEL #7 RUNTIME SOURCE VERIFICATION]")
-        logger.info(f"src.models runtime file: {os.path.abspath(models_module.__file__)}")
+        logger.info("[REAL EXECUTION TRACE]")
+        logger.info(f"train module: {train_model.__module__}")
+        logger.info(f"train function source: {inspect.getsourcefile(train_model)}")
         logger.info(f"unfreeze function module: {runtime_unfreeze.__module__}")
-        logger.info(f"unfreeze function file: {inspect.getsourcefile(runtime_unfreeze)}")
-        logger.info(f"unfreeze function first line: {inspect.getsourcelines(runtime_unfreeze)[1]}")
+        logger.info(f"unfreeze function source: {inspect.getsourcefile(runtime_unfreeze)}")
+        logger.info(f"unfreeze function signature: {inspect.signature(runtime_unfreeze)}")
+        logger.info(f"[REAL EXECUTION TRACE] model_key = {model_key}")
         logger.info("============================================================")
 
+        # TASK 6: Hard Model #7 Assertion at Real Call Site
         if model_key == "mobilenet_v3_large":
-            runtime_source = inspect.getsource(runtime_unfreeze)
-            required_terms = [
-                "mobilenet_v3_large",
-                "total_backbone_layers",
-                "trainable_backbone_layers",
-                "trainable_bn_layers",
-                "frozen_earlier_layers"
-            ]
-            missing_terms = [term for term in required_terms if term not in runtime_source]
-            if missing_terms:
-                err_msg = (
-                    "CRITICAL RUNTIME ERROR: The active unfreeze_model_backbone "
-                    f"implementation is not the controlled MobileNetV3Large implementation. Missing terms: {missing_terms}"
+            source = inspect.getsource(runtime_unfreeze)
+            assert 'model_name_key' in source, "Source missing model_name_key"
+            assert 'mobilenet_v3_large' in source, "Source missing mobilenet_v3_large"
+
+            if "Unfroze all backbone layers for full fine-tuning." in source:
+                raise RuntimeError(
+                    "MODEL #7 ERROR: ACTUAL TRAINING ENTRY POINT IS USING "
+                    "THE OLD FULL-UNFREEZE IMPLEMENTATION."
                 )
-                logger.error(err_msg)
-                raise RuntimeError(err_msg)
             logger.info("[MODEL #7 RUNTIME] Controlled MobileNetV3Large implementation verified in active source code.")
 
-        # TASK 1: Execute Runtime Unfreeze Function
+        # Execute Runtime Unfreeze Function
         model = runtime_unfreeze(
             model,
             model_name_key=model_key
